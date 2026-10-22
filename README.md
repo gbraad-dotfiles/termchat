@@ -1,7 +1,7 @@
 # terminal-chat
 
-Use **Gemini**, **Copilot** and **DeepSeek** chat from your terminal — with the
-accounts and sessions you are already signed into in your browser.
+Use Gemini, Copilot and DeepSeek chat from your terminal using the
+accounts and sessions you are already signed into from your browser.
 
 No API keys, no headless browser, no second browser profile. A tiny CLI talks
 to a small browser extension, which types your prompt into the open chat tab
@@ -19,11 +19,13 @@ and reads the answer back as it streams.
   └──────────────────────┘
 ```
 
+
 ## Requirements
 
 - Python 3.9+ (standard library only — nothing to `pip install`)
 - A Chromium-based browser (Vivaldi, Chrome, Edge, Brave…) — the primary target
 - A Firefox build is included as a convenience (`build.sh firefox`)
+
 
 ## Install
 
@@ -32,20 +34,25 @@ and reads the answer back as it streams.
 ```
 
 That links `termchat` into `~/.local/bin` (`PREFIX=…` to change) and prints the
-extension steps. Then, in **Vivaldi**:
+extension steps. Then, in Vivaldi:
 
 1. open `chrome://extensions`
-2. turn on **Developer mode** (top right)
-3. **Load unpacked** → select this repository's `extension/` directory
+2. turn on `Developer mode`
+3. `Load unpacked` and select this repository's `extension/` directory
 
 Open and sign in to the sites you want to use. After installing or reloading
-the extension, **reload the chat tabs** so the content script is injected.
+the extension, 
 
-> **Flatpak browsers** (e.g. `com.vivaldi.Vivaldi`) only see their sandbox. If
+> [!NOTE]
+> Reload the chat tabs so the content script is injected.
+
+> [!NOTE]
+> Flatpak browsers (e.g. `com.vivaldi.Vivaldi`) only see their sandbox. If
 > the file picker cannot reach this directory, either grant access with
 > `flatpak override --user --filesystem=/path/to/terminal-chat com.vivaldi.Vivaldi`
 > or copy `extension/` somewhere under `~/.var/app/com.vivaldi.Vivaldi/` and
 > load it from there.
+
 
 ### Packages
 
@@ -63,6 +70,7 @@ on first build; keep it to keep the same extension ID). Chrome and Vivaldi
 normally install `.crx` files only from the Chrome Web Store or through
 enterprise policy, so *Load unpacked* remains the reliable route for a personal
 build; the CRX is for browsers or policies that accept a self-signed package.
+
 
 ## Usage
 
@@ -97,6 +105,7 @@ the conversation that is already open.
 Answers stream to the terminal when stdout is a TTY. When piped, only the final
 text is printed, so `termchat … > answer.md` works as expected.
 
+
 ### Options
 
 | option | meaning |
@@ -109,18 +118,63 @@ text is printed, so `termchat … > answer.md` works as expected.
 | `--timeout SEC` | how long to wait for an answer (default 300) |
 | `--wait SEC` | how long to wait for the extension to pick the job up (default 30) |
 | `--json` | print `{site, text, error, meta}` |
+| `--server URL` | submit to a running `termchat serve` (`host[:port]`) |
+| `--local` | always start a private bridge, ignoring a running server |
 | `--port N` | base loopback port (default 8765) |
 | `--bind ADDR` | listen address (default `127.0.0.1`; use `0.0.0.0` for a remote browser) |
 | `--token T` | require this token from the extension (optional) |
 | `-v, --verbose` | log bridge traffic to stderr |
 
 Exit codes: `0` success, `1` page/job error, `2` usage, `3` no extension
-connected (or bridge unavailable).
+connected (or bridge/server unavailable).
+
+
+## Shared server
+
+By default every command starts its own short-lived bridge and exits when the
+answer arrives. If you want one bridge that the browser and several CLIs
+(including CLIs on other machines) share, run:
+
+```sh
+termchat serve --bind 0.0.0.0
+```
+
+It stays up, handles any number of jobs, and queues jobs per site. Then:
+
+```sh
+# on the server machine: plain commands find it automatically
+termchat gemini "hello"
+
+# on another machine: point at the server, or put it in config
+termchat gemini "hello" --server 10.0.21.22:8765
+```
+
+`~/.config/terminal-chat/config.json` on the client:
+
+```json
+{"server": "10.0.21.22:8765", "token": "same-as-the-server"}
+```
+
+
+Notes:
+
+- Only one extension tab per site is needed; it polls the server instead of a
+  one-off bridge.
+- Two clients asking the same site are served one after the other (FIFO).
+  Different sites run concurrently.
+- `--local` restores the per-command bridge (useful when testing, so a command
+  never joins a shared queue).
+- `--check` works in both modes and reports whether the extension is polling
+  the server.
+- A server on a non-loopback address should use `--token`; anyone who can reach
+  it can otherwise submit prompts.
+
 
 ## How it works
 
-1. The CLI starts a loopback HTTP server on the first free port in
-   `127.0.0.1:8765–8774` and queues the job.
+1. The CLI either submits to a running `termchat serve` (explicit `--server`,
+   or auto-detected on the local base port) or starts its own bridge on the
+   first free port in `127.0.0.1:8765–8774` and queues the job.
 2. The extension's background service worker discovers that port (it probes the
    range with `/v1/ping`) and long-polls `/v1/job` for open chat tabs.
 3. For each job the worker drives a small state machine through the content
@@ -136,6 +190,7 @@ Only `127.0.0.1` is bound by default. If you bind elsewhere, requests carrying
 a foreign `Origin` are still rejected, and the worker only talks to the bridge
 from the three supported sites — but anything on that network can also reach
 the bridge, so use `--token` unless the network is trusted.
+
 
 ## Browser on another machine
 
@@ -154,9 +209,9 @@ the same machine as the browser.
    {"bind": "0.0.0.0"}
    ```
 
-2. In the browser, open the extension's **Options** page (right-click the
-   extension → *Options*), set **Host** to the CLI machine's address
-   (e.g. `10.0.21.52`), and click **Save**. The browser asks for permission
+2. In the browser, open the extension's `Options` page (right-click the
+   extension `Options`), set `Host` to the CLI machine's address
+   (e.g. `10.0.21.52`), and click `Save`. The browser asks for permission
    to reach that host; allow it.
 
 The worker rescans the port range on its own, so no reload is needed. Make
@@ -172,7 +227,7 @@ ssh -N "${args[@]}" you@cli-machine
 
 ## Troubleshooting
 
-**"no browser tab picked up the job"**
+#### "no browser tab picked up the job"
 - Run `termchat <site> --check`. It reports one of three things:
   - *nothing reached the bridge* — the extension cannot see this machine: set
     the Options **Host**, allow the permission, check the firewall/route.
@@ -193,26 +248,28 @@ ssh -N "${args[@]}" you@cli-machine
   **Host** must be the CLI machine, not `127.0.0.1`.
 - Check the extension is enabled at `chrome://extensions`.
 
-**"could not type the prompt" / "could not submit"**
+#### "could not type the prompt" / "could not submit"
 - The site changed its DOM. Run `termchat <site> --inspect` and compare the
   reported `composer`, `sendMatches`, `responseCandidates` with the selectors
   in `extension/content.js` (`ADAPTERS`). Update the selector and reload the
   extension.
 
-**Answers stop early or run long**
+#### Answers stop early or run long
 - Completion is detected by the stop control disappearing plus a stable answer.
   If the control is missing, 1.5 s of unchanged text is enough; if it never
   disappears, the worker waits 20 s of quiet before finishing. A site that
   changes its stop control still works, at the cost of a later finish.
 
-**Nothing happens for a while on the first command**
+#### Nothing happens for a while on the first command
 - The browser may have suspended the extension worker while idle. The content
   script reconnects on focus/visibility; moving to the tab wakes it. Once the
   worker is polling, jobs are picked up within ~2 s.
 
+
 ## Limitations
 
-- One job at a time per site (concurrent CLI calls on different sites are fine).
+- One job at a time per site. With `termchat serve`, jobs for the same site
+  queue; with per-command bridges, concurrent calls on different sites are fine.
 - Text only; file *attachments* (images/PDF) are not uploaded — file contents
   are included in the prompt text instead.
 - These are consumer web UIs without a stable API. Selectors will occasionally
@@ -220,11 +277,12 @@ ssh -N "${args[@]}" you@cli-machine
 - The extension types into your real session, so it can do anything you could
   do in that tab. It only ever receives prompts from your local CLI.
 
+
 ## Development
 
 ```sh
 ./build.sh            # dist/chromium, dist/firefox, .zip and signed .crx
-./tests/run.sh        # protocol tests with a fake extension (no browser needed)
+./tests/run.sh        # protocol + server tests with a fake extension (no browser)
 ./sync.sh --build     # copy the folder to another machine (REMOTE=… to change)
 ```
 
@@ -233,3 +291,4 @@ not.
 
 The CLI is a single file (`bin/termchat`), the extension is three files
 (`manifest.json`, `background.js`, `content.js`).
+

@@ -70,6 +70,44 @@ async function loadSettings() {
 
 const settingsReady = loadSettings();
 
+/* Chrome does not inject content scripts into tabs that were already open when
+ * the extension was installed or reloaded. Re-inject on worker startup so those
+ * tabs start working without a manual reload; content.js ignores a second copy. */
+const SITE_MATCHES = [
+  'https://gemini.google.com/*',
+  'https://copilot.microsoft.com/*',
+  'https://chat.deepseek.com/*',
+];
+
+async function injectIntoOpenTabs() {
+  if (!api.scripting || !api.tabs || !api.tabs.query) return;
+  try {
+    const tabs = await api.tabs.query({ url: SITE_MATCHES });
+    await Promise.all(
+      tabs.map(async (tab) => {
+        if (tab.id == null) return;
+        try {
+          await api.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ['content.js'],
+          });
+        } catch {
+          /* discarded tab or navigation in progress */
+        }
+      })
+    );
+  } catch {
+    /* no access; the declared content scripts still run on page load */
+  }
+}
+
+settingsReady.then(injectIntoOpenTabs);
+if (api.runtime && api.runtime.onInstalled) {
+  api.runtime.onInstalled.addListener(() => {
+    settingsReady.then(injectIntoOpenTabs);
+  });
+}
+
 function bridgeUrl(port, path) {
   const host =
     settings.host.includes(':') && !settings.host.startsWith('[')

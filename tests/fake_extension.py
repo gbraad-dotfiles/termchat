@@ -56,6 +56,7 @@ def main() -> int:
     parser.add_argument("--dump-prompt", metavar="PATH")
     parser.add_argument("--error", metavar="MESSAGE")
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--jobs", type=int, default=1, help="jobs to handle before exiting")
     parser.add_argument("--token", default="")
     args = parser.parse_args()
 
@@ -68,14 +69,22 @@ def main() -> int:
         return 1
 
     deadline = time.monotonic() + args.timeout
-    while time.monotonic() < deadline:
-        try:
-            _, job = call(port, f"/v1/job?site={args.site}&wait=1", timeout=3.0)
-        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-            print(f"fake extension: {exc}", file=sys.stderr)
+    handled = 0
+    while handled < args.jobs:
+        job = None
+        while time.monotonic() < deadline and job is None:
+            try:
+                _, job = call(port, f"/v1/job?site={args.site}&wait=1", timeout=3.0)
+            except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+                print(f"fake extension: {exc}", file=sys.stderr)
+                return 1
+            if not job:
+                continue
+
+        if job is None:
+            print("fake extension: timed out waiting for a job", file=sys.stderr)
             return 1
-        if not job:
-            continue
+        handled += 1
 
         prompt = job.get("prompt", "")
         if args.dump_prompt:
@@ -93,7 +102,7 @@ def main() -> int:
                     "meta": {"site": args.site, "composer": {"tag": "textarea"}, "fake": True},
                 },
             )
-            return 0
+            continue
 
         if args.error:
             call(
@@ -102,7 +111,7 @@ def main() -> int:
                 "POST",
                 {"text": "", "error": args.error, "meta": {"fake": True}},
             )
-            return 0
+            continue
 
         reply = prompt if args.reply == "@echo" else args.reply
         step = max(1, len(reply) // max(1, args.chunks))
@@ -120,10 +129,8 @@ def main() -> int:
             "POST",
             {"text": reply, "error": None, "meta": {"fake": True}},
         )
-        return 0
 
-    print("fake extension: timed out waiting for a job", file=sys.stderr)
-    return 1
+    return 0
 
 
 if __name__ == "__main__":

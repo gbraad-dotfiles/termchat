@@ -3,7 +3,7 @@
   "name": "termchat bridge",
   "version": "0.1.0",
   "description": "Connects gemini.google.com, copilot.microsoft.com and chat.deepseek.com to the termchat CLI.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "scripting"],
   "optional_host_permissions": ["http://*/*"],
   "options_ui": {
     "page": "options.html",
@@ -14,7 +14,10 @@
   },
   "host_permissions": [
     "http://127.0.0.1/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "https://gemini.google.com/*",
+    "https://copilot.microsoft.com/*",
+    "https://chat.deepseek.com/*"
   ],
   "content_scripts": [
     {

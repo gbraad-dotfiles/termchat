@@ -16,6 +16,11 @@
 (() => {
   'use strict';
 
+  // The worker may inject this file into tabs that were already open when the
+  // extension was installed or reloaded. Do not start a second session.
+  if (globalThis.__termchatContentLoaded) return;
+  globalThis.__termchatContentLoaded = true;
+
   const api = globalThis.browser ?? globalThis.chrome;
   if (!api || !api.runtime || !api.runtime.connect) return;
 

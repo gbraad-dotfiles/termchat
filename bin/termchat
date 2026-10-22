@@ -17,6 +17,8 @@ import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -59,35 +61,78 @@ class Job:
     state: str = "pending"  # pending | running | done
     assigned: bool = False
     assigned_at: float = 0.0
+    seq: int = 0
+    finished_at: float = 0.0
+    last_seen: float = 0.0
 
 
 class Bridge:
     """Job queue plus the condition variable the CLI waits on."""
 
-    def __init__(self, verbose: bool = False, token: str = "") -> None:
+    def __init__(
+        self,
+        verbose: bool = False,
+        token: str = "",
+        mode: str = "ephemeral",
+        pending_ttl: float = 15.0,
+    ) -> None:
         self.verbose = verbose
         self.token = token
+        self.mode = mode
+        self.pending_ttl = pending_ttl
         self.cond = threading.Condition()
         self.pending: list[Job] = []
         self.active: dict[str, Job] = {}
+        self.jobs: dict[str, Job] = {}
         self.pings = 0
+        self.last_ping = 0.0
         self.polls: set[str] = set()
 
     def submit(self, job: Job) -> None:
         with self.cond:
+            job.last_seen = time.monotonic()
+            self.jobs[job.id] = job
             self.pending.append(job)
+            self._prune()
             self.cond.notify_all()
+
+    def _prune(self) -> None:
+        """Drop abandoned and old finished jobs. Caller holds the condition."""
+        now = time.monotonic()
+        for job_id, job in list(self.jobs.items()):
+            if (
+                job.state == "pending"
+                and self.mode == "server"
+                and now - job.last_seen > self.pending_ttl
+            ):
+                self.pending = [pending for pending in self.pending if pending.id != job_id]
+                self.jobs.pop(job_id, None)
+            elif job.state == "done" and now - job.finished_at > 3600:
+                self.jobs.pop(job_id, None)
+        extra = len(self.jobs) - 500
+        if extra > 0:
+            done = sorted(
+                (job.finished_at, job_id)
+                for job_id, job in self.jobs.items()
+                if job.state == "done"
+            )
+            for _, job_id in done[:extra]:
+                self.jobs.pop(job_id, None)
 
     def take(self, site: str, wait: float) -> Job | None:
         deadline = time.monotonic() + max(0.0, wait)
         with self.cond:
+            self._prune()
             while True:
                 for job in list(self.pending):
                     if job.site == site:
-                        self.pending.remove(job)
+                        self.pending = [
+                            pending for pending in self.pending if pending.id != job.id
+                        ]
                         job.assigned = True
                         job.state = "running"
                         job.assigned_at = time.monotonic()
+                        job.seq += 1
                         self.active[job.id] = job
                         self.cond.notify_all()
                         return job
@@ -95,6 +140,7 @@ class Bridge:
                 if remaining <= 0:
                     return None
                 self.cond.wait(remaining)
+                self._prune()
 
     def update(
         self,
@@ -116,8 +162,66 @@ class Bridge:
                 job.meta = meta
             if state is not None:
                 job.state = state
+            job.seq += 1
             if state == "done":
+                job.finished_at = time.monotonic()
                 self.active.pop(job_id, None)
+            self.cond.notify_all()
+            return True
+
+    def snapshot(self, job_id: str, after: int = -1, wait: float = 0.0) -> dict | None:
+        """Current job state; long-polls until seq > after, done, or timeout."""
+        deadline = time.monotonic() + max(0.0, wait)
+        with self.cond:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return None
+            # Any state poll is a heartbeat: a live client keeps its queued job.
+            job.last_seen = time.monotonic()
+            self._prune()
+            while job.seq <= after and job.state != "done":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.cond.wait(remaining)
+                job.last_seen = time.monotonic()
+            return self._snapshot(job)
+
+    def _snapshot(self, job: Job) -> dict:
+        ahead = 0
+        now = time.monotonic()
+        if job.state == "pending":
+            for other in self.pending:
+                if other.id == job.id:
+                    break
+                if other.site == job.site and (
+                    self.mode != "server"
+                    or now - other.last_seen <= self.pending_ttl
+                ):
+                    ahead += 1
+        return {
+            "id": job.id,
+            "site": job.site,
+            "state": job.state,
+            "text": job.text,
+            "error": job.error,
+            "meta": job.meta,
+            "inspect": job.inspect,
+            "seq": job.seq,
+            "queued_ahead": ahead,
+        }
+
+    def cancel(self, job_id: str) -> bool:
+        with self.cond:
+            job = self.jobs.get(job_id)
+            if job is None or job.state == "done":
+                return False
+            self.pending = [pending for pending in self.pending if pending.id != job_id]
+            self.active.pop(job_id, None)
+            job.state = "done"
+            job.error = "canceled by client"
+            job.seq += 1
+            job.finished_at = time.monotonic()
             self.cond.notify_all()
             return True
 
@@ -225,12 +329,48 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         url = urlparse(self.path)
         if url.path == "/v1/ping":
+            query = parse_qs(url.query)
+            probe = (query.get("probe") or [""])[0]
             with self.bridge.cond:
-                self.bridge.pings += 1
-                self.bridge.cond.notify_all()
-            self._send(200, {"app": APP, "version": VERSION, "sites": list(SITES)}, origin)
+                if probe != "client":
+                    self.bridge.pings += 1
+                    self.bridge.last_ping = time.monotonic()
+                    self.bridge.cond.notify_all()
+                age = (
+                    None
+                    if not self.bridge.last_ping
+                    else round(time.monotonic() - self.bridge.last_ping, 1)
+                )
+                payload = {
+                    "app": APP,
+                    "version": VERSION,
+                    "sites": list(SITES),
+                    "mode": self.bridge.mode,
+                    "polls": sorted(self.bridge.polls),
+                    "pending": len(self.bridge.pending),
+                    "active": len(self.bridge.active),
+                    "last_ping_age": age,
+                }
+            self._send(200, payload, origin)
             return
         if not self._authorized(origin):
+            return
+        if url.path.startswith("/v1/state/"):
+            job_id = url.path[len("/v1/state/") :].strip("/")
+            query = parse_qs(url.query)
+            try:
+                after = int((query.get("after") or ["-1"])[0])
+            except ValueError:
+                after = -1
+            try:
+                wait_s = float((query.get("wait") or ["0"])[0])
+            except ValueError:
+                wait_s = 0.0
+            snap = self.bridge.snapshot(job_id, after, min(max(wait_s, 0.0), 25.0))
+            if snap is None:
+                self._send(404, {"error": "unknown job"}, origin)
+            else:
+                self._send(200, snap, origin)
             return
         if url.path == "/v1/job":
             query = parse_qs(url.query)
@@ -273,6 +413,39 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         url = urlparse(self.path)
         parts = [part for part in url.path.split("/") if part]
+        if url.path == "/v1/request":
+            payload = self._read_json()
+            if payload is None:
+                self._send(400, {"error": "invalid JSON body"}, origin)
+                return
+            site = str(payload.get("site") or "")
+            if site not in SITES:
+                self._send(400, {"error": "unknown site"}, origin)
+                return
+            prompt = payload.get("prompt")
+            if not isinstance(prompt, str):
+                self._send(400, {"error": "prompt must be a string"}, origin)
+                return
+            try:
+                job_timeout = float(payload.get("timeout") or DEFAULT_TIMEOUT)
+            except (TypeError, ValueError):
+                job_timeout = DEFAULT_TIMEOUT
+            job = Job(
+                site=site,
+                prompt=prompt,
+                new_chat=bool(payload.get("new_chat", True)),
+                inspect=bool(payload.get("inspect", False)),
+                timeout=max(1.0, job_timeout),
+            )
+            self.bridge.submit(job)
+            self._send(200, {"id": job.id, "site": site}, origin)
+            return
+        if len(parts) == 4 and parts[0] == "v1" and parts[1] == "request" and parts[3] == "cancel":
+            if not self.bridge.cancel(parts[2]):
+                self._send(404, {"error": "unknown or finished job"}, origin)
+                return
+            self._send(200, {"ok": True}, origin)
+            return
         if len(parts) == 4 and parts[0] == "v1" and parts[1] == "job" and parts[3] in (
             "progress",
             "done",
@@ -325,6 +498,171 @@ def start_bridge(
     raise SystemExit(
         f"termchat: could not bind {bind} port in {base_port}..{base_port + span - 1}"
     )
+
+
+# --------------------------------------------------------------------------
+# shared server / client
+# --------------------------------------------------------------------------
+
+
+class RemoteError(RuntimeError):
+    pass
+
+
+class RemoteClient:
+    """Talks to a persistent `termchat serve` process."""
+
+    def __init__(self, url: str, token: str = "") -> None:
+        self.url = url.rstrip("/")
+        self.token = token
+
+    def _call(
+        self,
+        path: str,
+        method: str = "GET",
+        body: dict | None = None,
+        timeout: float = 5.0,
+    ) -> dict | None:
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(self.url + path, data=data, method=method)
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        if self.token:
+            request.add_header("X-Termchat-Token", self.token)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                payload = json.loads(exc.read() or b"{}")
+                if isinstance(payload, dict):
+                    detail = str(payload.get("error") or "")
+            except (ValueError, OSError):
+                pass
+            raise RemoteError(detail or f"HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RemoteError(f"cannot reach {self.url}: {exc}") from exc
+        if not raw:
+            return None
+        try:
+            payload = json.loads(raw)
+        except ValueError as exc:
+            raise RemoteError(f"invalid response from {self.url}") from exc
+        return payload if isinstance(payload, dict) else None
+
+    def ping(self) -> dict | None:
+        return self._call("/v1/ping?probe=client", timeout=1.5)
+
+    def submit(self, job: Job) -> str:
+        payload = self._call(
+            "/v1/request",
+            "POST",
+            {
+                "site": job.site,
+                "prompt": job.prompt,
+                "new_chat": job.new_chat,
+                "inspect": job.inspect,
+                "timeout": job.timeout,
+            },
+            timeout=10.0,
+        )
+        if not payload or not payload.get("id"):
+            raise RemoteError("server did not return a job id")
+        return str(payload["id"])
+
+    def state(self, job_id: str, after: int, wait: float = 2.0) -> dict:
+        payload = self._call(
+            f"/v1/state/{job_id}?after={after}&wait={wait:g}",
+            timeout=wait + 5.0,
+        )
+        if not payload:
+            raise RemoteError("server returned no job state")
+        return payload
+
+    def cancel(self, job_id: str) -> None:
+        try:
+            self._call(f"/v1/request/{job_id}/cancel", "POST", {}, timeout=3.0)
+        except RemoteError:
+            pass
+
+
+def normalize_server_url(value: str, default_port: int) -> str:
+    if "://" not in value:
+        value = "http://" + value
+    parsed = urlparse(value)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or default_port
+    hostpart = f"[{host}]" if ":" in host else host
+    return f"http://{hostpart}:{port}"
+
+
+def detect_server(base_port: int) -> str | None:
+    """Return the local persistent server's URL, ignoring ephemeral bridges."""
+    url = f"http://127.0.0.1:{base_port}"
+    try:
+        payload = RemoteClient(url).ping()
+    except RemoteError:
+        return None
+    if payload and payload.get("app") == APP and payload.get("mode") == "server":
+        return url
+    return None
+
+
+def check_remote(remote: RemoteClient, site: str, wait: float, verbose: bool = False) -> int:
+    deadline = time.monotonic() + max(0.0, wait)
+    last_error = ""
+    last_age: float | None = None
+    while True:
+        try:
+            info = remote.ping()
+        except RemoteError as exc:
+            last_error = str(exc)
+            info = None
+        if info:
+            polls = info.get("polls") or []
+            age = info.get("last_ping_age")
+            if isinstance(age, (int, float)):
+                last_age = float(age)
+            if verbose:
+                print(
+                    f"termchat: server {remote.url}: pending={info.get('pending', 0)} "
+                    f"active={info.get('active', 0)} polls={','.join(polls) or '-'} "
+                    f"last_ping={'-' if age is None else f'{age}s ago'}",
+                    file=sys.stderr,
+                )
+            if site in polls:
+                print(
+                    f"termchat: the extension is polling for {site}. "
+                    "The server is reachable.",
+                    file=sys.stderr,
+                )
+                return 0
+            last_error = ""
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
+
+    if last_error:
+        print(f"termchat: {last_error}", file=sys.stderr)
+        print(
+            "termchat: is 'termchat serve' running and reachable from this machine?",
+            file=sys.stderr,
+        )
+    elif last_age is not None and last_age < 15:
+        print(
+            f"termchat: the extension is reaching the server, but no chat tab is "
+            f"polling for {site}. Reload the {site} tab.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "termchat: nothing reached the server recently. If the browser runs on "
+            "another machine, set the extension Options Host to this machine (not "
+            "127.0.0.1), allow the permission, then reload the chat tab.",
+            file=sys.stderr,
+        )
+    return 1
 
 
 # --------------------------------------------------------------------------
@@ -582,14 +920,139 @@ def run_job(
     return 0
 
 
+def run_remote(
+    remote: RemoteClient,
+    job: Job,
+    *,
+    timeout: float,
+    wait: float,
+    stream: bool,
+    json_mode: bool,
+) -> int:
+    try:
+        job_id = remote.submit(job)
+    except RemoteError as exc:
+        print(f"termchat: {exc}", file=sys.stderr)
+        return 3
+
+    start = time.monotonic()
+    deadline = start + timeout + 30
+    idle_since = start
+    after = -1
+    printed = ""
+    picked = False
+    state = "pending"
+    text = ""
+    error: str | None = None
+    meta: dict | None = None
+
+    try:
+        while True:
+            try:
+                snap = remote.state(job_id, after, 2.0)
+            except RemoteError as exc:
+                if "unknown job" in str(exc):
+                    print(
+                        "termchat: the server no longer has this job "
+                        "(its client stopped polling).",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"termchat: {exc}", file=sys.stderr)
+                return 1
+            after = int(snap.get("seq", after))
+            state = str(snap.get("state") or state)
+            text = str(snap.get("text") or "")
+            error = snap.get("error") or None
+            meta = snap.get("meta") or None
+            if state in ("running", "done"):
+                picked = True
+
+            queued = int(snap.get("queued_ahead") or 0)
+            if queued:
+                # Someone else's job is ahead of us; the connect timeout
+                # should not start until our turn.
+                idle_since = time.monotonic()
+
+            if not picked and time.monotonic() - idle_since > wait:
+                if queued == 0:
+                    remote.cancel(job_id)
+                    print(
+                        f"termchat: no browser tab picked up the job (server {remote.url}).",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"termchat: run 'termchat {job.site} --check' to see whether the "
+                        "extension can reach this server.",
+                        file=sys.stderr,
+                    )
+                    return 3
+
+            if stream and text != printed:
+                printed = print_delta(text, printed, stream)
+            if state == "done":
+                break
+            if time.monotonic() > deadline:
+                remote.cancel(job_id)
+                error = f"timed out after {timeout:g}s waiting for the page"
+                break
+    except KeyboardInterrupt:
+        remote.cancel(job_id)
+        raise
+
+    if snap.get("inspect"):
+        print(json.dumps(meta or {}, indent=2, ensure_ascii=False))
+        return 0 if state == "done" and not error else 1
+
+    if error:
+        if stream and printed:
+            sys.stdout.write("\n")
+        print(f"termchat: {error}", file=sys.stderr)
+        if meta:
+            failed = Job(
+                site=job.site,
+                prompt="",
+                new_chat=False,
+                inspect=False,
+                timeout=0,
+                error=error,
+                meta=meta,
+                state="done",
+            )
+            path = save_diagnostics(failed)
+            if path is not None:
+                print(f"termchat: page diagnostics saved to {path}", file=sys.stderr)
+        if json_mode:
+            print(
+                json.dumps(
+                    {"site": job.site, "text": text or "", "error": error, "meta": meta},
+                    ensure_ascii=False,
+                )
+            )
+        return 1
+
+    final = text or ""
+    if json_mode:
+        print(
+            json.dumps(
+                {"site": job.site, "text": final, "error": None, "meta": meta},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        emit_final(final, printed, stream)
+    return 0
+
+
 def interactive(
-    bridge: Bridge,
+    bridge: Bridge | None,
     args: argparse.Namespace,
     *,
     timeout: float,
     wait: float,
     stream: bool,
     bridge_hint: str = "",
+    remote: RemoteClient | None = None,
 ) -> int:
     site = args.site
     new_chat = not args.continue_chat
@@ -642,28 +1105,41 @@ def interactive(
             continue
         if command == ":inspect":
             job = Job(site=site, prompt="", new_chat=False, inspect=True, timeout=timeout)
+            if remote is not None:
+                run_remote(remote, job, timeout=timeout, wait=wait, stream=False, json_mode=True)
+            else:
+                run_job(
+                    bridge,
+                    job,
+                    timeout=timeout,
+                    wait=wait,
+                    stream=False,
+                    json_mode=True,
+                    bridge_hint=bridge_hint,
+                )
+            continue
+
+        job = Job(site=site, prompt=line, new_chat=new_chat, inspect=False, timeout=timeout)
+        new_chat = False
+        if remote is not None:
+            run_remote(
+                remote,
+                job,
+                timeout=timeout,
+                wait=wait,
+                stream=stream,
+                json_mode=args.json,
+            )
+        else:
             run_job(
                 bridge,
                 job,
                 timeout=timeout,
                 wait=wait,
-                stream=False,
-                json_mode=True,
+                stream=stream,
+                json_mode=args.json,
                 bridge_hint=bridge_hint,
             )
-            continue
-
-        job = Job(site=site, prompt=line, new_chat=new_chat, inspect=False, timeout=timeout)
-        new_chat = False
-        run_job(
-            bridge,
-            job,
-            timeout=timeout,
-            wait=wait,
-            stream=stream,
-            json_mode=args.json,
-            bridge_hint=bridge_hint,
-        )
 
 
 # --------------------------------------------------------------------------
@@ -698,6 +1174,83 @@ def as_int(value: object, default: int) -> int:
         return int(default)
 
 
+def serve_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="termchat serve",
+        description=(
+            "Run one persistent bridge that the browser extension and any number "
+            "of termchat clients can share."
+        ),
+    )
+    parser.add_argument(
+        "--bind",
+        default=None,
+        metavar="ADDR",
+        help="address to listen on (default 127.0.0.1; 0.0.0.0 for remote clients)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"port to listen on (default {DEFAULT_BASE_PORT})",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        metavar="TOKEN",
+        help="require this token from extensions and clients",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="log bridge traffic")
+    args = parser.parse_args(argv)
+
+    config = load_config()
+    port = args.port or as_int(
+        os.environ.get("TERMCHAT_BASE_PORT") or config.get("base_port"), DEFAULT_BASE_PORT
+    )
+    bind = (
+        args.bind
+        or os.environ.get("TERMCHAT_BIND")
+        or str(config.get("bind") or "127.0.0.1")
+    )
+    token = (
+        args.token
+        if args.token is not None
+        else os.environ.get("TERMCHAT_TOKEN") or str(config.get("token") or "")
+    )
+    pending_ttl = as_float(
+        os.environ.get("TERMCHAT_PENDING_TTL") or config.get("pending_ttl"), 15.0
+    )
+
+    bridge = Bridge(
+        verbose=args.verbose,
+        token=token,
+        mode="server",
+        pending_ttl=max(1.0, pending_ttl),
+    )
+    BridgeHandler.bridge = bridge
+    try:
+        server = ThreadingHTTPServer((bind, port), BridgeHandler)
+    except OSError as exc:
+        print(f"termchat: cannot listen on {bind}:{port}: {exc}", file=sys.stderr)
+        print("termchat: is another server already using that port?", file=sys.stderr)
+        return 1
+    server.daemon_threads = True
+    print(f"termchat: server listening on http://{bind}:{port}", file=sys.stderr)
+    if not is_loopback_address(bind) and not token:
+        print(
+            f"termchat: no token; anyone who can reach http://{bind}:{port} "
+            "can submit jobs",
+            file=sys.stderr,
+        )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+    finally:
+        server.server_close()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="termchat",
@@ -712,6 +1265,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  cat notes.md | termchat deepseek 'Summarise this'\n"
             "  termchat gemini --continue 'And what about the error path?'\n"
             "  termchat deepseek --inspect\n"
+            "  termchat serve --bind 0.0.0.0\n"
+            "  termchat gemini 'hi' --server 10.0.0.5:8765\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -774,6 +1329,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="print a JSON object instead of the answer text",
     )
     parser.add_argument(
+        "--server",
+        default=None,
+        metavar="URL",
+        help=(
+            "submit to a running 'termchat serve' (host[:port] or http://host:port); "
+            "default: auto-detect a local server"
+        ),
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="always start a private bridge, ignoring any running server",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=None,
@@ -796,11 +1365,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "serve":
+        return serve_main(argv[1:])
+
     parser = build_parser()
     args = parser.parse_args(argv)
 
     if args.new and args.continue_chat:
         parser.error("--new and --continue are mutually exclusive")
+    if args.local and args.server:
+        parser.error("--server and --local are mutually exclusive")
 
     config = load_config()
     base_port = args.port or as_int(
@@ -828,6 +1403,24 @@ def main(argv: list[str] | None = None) -> int:
         else os.environ.get("TERMCHAT_TOKEN") or str(config.get("token") or "")
     )
 
+    remote: RemoteClient | None = None
+    if not args.local:
+        configured_server = (
+            args.server
+            or os.environ.get("TERMCHAT_SERVER")
+            or str(config.get("server") or "")
+        )
+        if configured_server:
+            remote = RemoteClient(
+                normalize_server_url(configured_server, base_port), token
+            )
+        else:
+            detected = detect_server(base_port)
+            if detected is not None:
+                remote = RemoteClient(detected, token)
+                if args.verbose:
+                    print(f"termchat: using server {detected}", file=sys.stderr)
+
     if args.check:
         prompt = ""
     else:
@@ -852,6 +1445,31 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    stream = not args.json and sys.stdout.isatty()
+
+    if remote is not None:
+        if args.check:
+            return check_remote(remote, args.site, wait, args.verbose)
+        if args.interactive:
+            return interactive(
+                None, args, timeout=timeout, wait=wait, stream=stream, remote=remote
+            )
+        job = Job(
+            site=args.site,
+            prompt=prompt,
+            new_chat=not args.continue_chat,
+            inspect=args.inspect,
+            timeout=timeout,
+        )
+        return run_remote(
+            remote,
+            job,
+            timeout=timeout,
+            wait=wait,
+            stream=stream,
+            json_mode=args.json,
+        )
+
     bridge = Bridge(verbose=args.verbose, token=token)
     server, port = start_bridge(bridge, base_port, span, bind)
     if args.verbose:
@@ -864,7 +1482,6 @@ def main(argv: list[str] | None = None) -> int:
             )
     bridge_hint = f"port {port}" if bind in ("0.0.0.0", "::") else f"{bind}:{port}"
 
-    stream = not args.json and sys.stdout.isatty()
     try:
         if args.check:
             return check_bridge(bridge, bind, port, wait, args.site)

@@ -33,6 +33,7 @@
       border: 1px solid #8886;
       cursor: pointer;
     }
+    .actions { display: flex; gap: .5rem; align-items: center; }
     #status { margin-top: 1rem; }
     #status.ok { color: #2a7a2a; }
     #status.error { color: #b03030; }
@@ -58,7 +59,10 @@
   <input id="token" type="password" autocomplete="off" spellcheck="false">
   <p class="hint">Only needed if the CLI was started with <code>--token</code>.</p>
 
-  <button id="save">Save</button>
+  <div class="actions">
+    <button id="save">Save</button>
+    <button id="test" type="button">Test connection</button>
+  </div>
   <p id="status" role="status"></p>
 
   <script src="options.js"></script>
