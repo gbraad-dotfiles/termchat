@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>termchat bridge</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font: 14px/1.5 system-ui, sans-serif;
+      max-width: 34rem;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }
+    h1 { font-size: 1.2rem; margin-bottom: .25rem; }
+    p.lead { margin-top: 0; opacity: .75; }
+    label { display: block; margin: 1rem 0 .25rem; font-weight: 600; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: .45rem .55rem;
+      font: inherit;
+      border: 1px solid #8886;
+      border-radius: 6px;
+      background: Canvas;
+      color: CanvasText;
+    }
+    .hint { margin: .25rem 0 0; font-size: .85em; opacity: .7; }
+    button {
+      margin-top: 1.25rem;
+      padding: .5rem 1rem;
+      font: inherit;
+      border-radius: 6px;
+      border: 1px solid #8886;
+      cursor: pointer;
+    }
+    #status { margin-top: 1rem; }
+    #status.ok { color: #2a7a2a; }
+    #status.error { color: #b03030; }
+  </style>
+</head>
+<body>
+  <h1>termchat bridge</h1>
+  <p class="lead">Where the termchat CLI is listening. Leave the defaults if the
+    CLI runs on this machine.</p>
+
+  <label for="host">Host</label>
+  <input id="host" placeholder="127.0.0.1" spellcheck="false">
+  <p class="hint">The address of the machine running <code>termchat</code>, for
+    example <code>10.0.21.52</code>.</p>
+
+  <label for="basePort">Base port</label>
+  <input id="basePort" type="number" min="1" max="65535" placeholder="8765">
+
+  <label for="span">Ports to scan</label>
+  <input id="span" type="number" min="1" max="50" placeholder="10">
+
+  <label for="token">Token (optional)</label>
+  <input id="token" type="password" autocomplete="off" spellcheck="false">
+  <p class="hint">Only needed if the CLI was started with <code>--token</code>.</p>
+
+  <button id="save">Save</button>
+  <p id="status" role="status"></p>
+
+  <script src="options.js"></script>
+</body>
+</html>

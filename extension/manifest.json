@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "termchat bridge",
+  "version": "0.1.0",
+  "description": "Connects gemini.google.com, copilot.microsoft.com and chat.deepseek.com to the termchat CLI.",
+  "permissions": ["storage"],
+  "optional_host_permissions": ["http://*/*"],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://copilot.microsoft.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

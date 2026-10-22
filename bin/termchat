@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""termchat: talk to Gemini, Copilot and DeepSeek from a terminal.
+
+No vendor API is used. The CLI starts a local HTTP bridge (loopback by
+default); the companion browser extension polls that bridge from an open chat
+tab, types the prompt into the page, scrapes the streamed answer and posts it
+back. You stay signed in in your normal browser profile.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hmac
+import ipaddress
+import json
+import os
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+APP = "termchat"
+VERSION = "0.1.0"
+SITES = ("gemini", "copilot", "deepseek")
+SITE_ORIGINS = {
+    "gemini": "https://gemini.google.com",
+    "copilot": "https://copilot.microsoft.com",
+    "deepseek": "https://chat.deepseek.com",
+}
+ALLOWED_ORIGINS = frozenset(SITE_ORIGINS.values())
+DEFAULT_BASE_PORT = 8765
+DEFAULT_PORT_SPAN = 10
+DEFAULT_TIMEOUT = 300.0
+DEFAULT_CONNECT_WAIT = 30.0
+MAX_BODY = 16 * 1024 * 1024
+LARGE_PROMPT = 100_000
+
+
+# --------------------------------------------------------------------------
+# state shared with the HTTP handlers
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Job:
+    site: str
+    prompt: str
+    new_chat: bool
+    inspect: bool
+    timeout: float
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    text: str = ""
+    error: str | None = None
+    meta: dict | None = None
+    state: str = "pending"  # pending | running | done
+    assigned: bool = False
+    assigned_at: float = 0.0
+
+
+class Bridge:
+    """Job queue plus the condition variable the CLI waits on."""
+
+    def __init__(self, verbose: bool = False, token: str = "") -> None:
+        self.verbose = verbose
+        self.token = token
+        self.cond = threading.Condition()
+        self.pending: list[Job] = []
+        self.active: dict[str, Job] = {}
+        self.pings = 0
+        self.polls: set[str] = set()
+
+    def submit(self, job: Job) -> None:
+        with self.cond:
+            self.pending.append(job)
+            self.cond.notify_all()
+
+    def take(self, site: str, wait: float) -> Job | None:
+        deadline = time.monotonic() + max(0.0, wait)
+        with self.cond:
+            while True:
+                for job in list(self.pending):
+                    if job.site == site:
+                        self.pending.remove(job)
+                        job.assigned = True
+                        job.state = "running"
+                        job.assigned_at = time.monotonic()
+                        self.active[job.id] = job
+                        self.cond.notify_all()
+                        return job
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self.cond.wait(remaining)
+
+    def update(
+        self,
+        job_id: str,
+        text: str | None = None,
+        error: str | None = None,
+        meta: dict | None = None,
+        state: str | None = None,
+    ) -> bool:
+        with self.cond:
+            job = self.active.get(job_id)
+            if job is None:
+                return False
+            if text is not None:
+                job.text = text
+            if error is not None:
+                job.error = error
+            if meta is not None:
+                job.meta = meta
+            if state is not None:
+                job.state = state
+            if state == "done":
+                self.active.pop(job_id, None)
+            self.cond.notify_all()
+            return True
+
+
+# --------------------------------------------------------------------------
+# HTTP bridge
+# --------------------------------------------------------------------------
+
+
+def origin_allowed(origin: str) -> bool:
+    if origin in ALLOWED_ORIGINS:
+        return True
+    return origin.startswith(("chrome-extension://", "moz-extension://"))
+
+
+def is_loopback_address(bind: str) -> bool:
+    if bind == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        return False
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    bridge: Bridge  # set by start_bridge() before serving
+    server_version = f"{APP}/{VERSION}"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        if self.bridge.verbose:
+            sys.stderr.write("[bridge] " + (fmt % args) + "\n")
+
+    # -- helpers ---------------------------------------------------------
+
+    def _send(self, status: int, payload: dict | None = None, origin: str = "") -> None:
+        body = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            if body:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _origin(self) -> str | None:
+        """Return the allowed Origin ('' when absent), or None after a 403."""
+        origin = self.headers.get("Origin") or ""
+        if origin and not origin_allowed(origin):
+            self._send(403, {"error": "origin not allowed"})
+            return None
+        return origin
+
+    def _authorized(self, origin: str = "") -> bool:
+        """When a token is configured, require it on job traffic."""
+        token = self.bridge.token
+        if not token:
+            return True
+        supplied = self.headers.get("X-Termchat-Token") or ""
+        if hmac.compare_digest(supplied.encode("utf-8"), token.encode("utf-8")):
+            return True
+        self._send(401, {"error": "missing or invalid token"}, origin)
+        return False
+
+    def _read_json(self) -> dict | None:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length < 0 or length > MAX_BODY:
+            return None
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    # -- verbs -----------------------------------------------------------
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 (http.server API)
+        origin = self.headers.get("Origin") or ""
+        if origin and not origin_allowed(origin):
+            self._send(403, {"error": "origin not allowed"})
+            return
+        self.send_response(204)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Termchat-Token")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        origin = self._origin()
+        if origin is None:
+            return
+        url = urlparse(self.path)
+        if url.path == "/v1/ping":
+            with self.bridge.cond:
+                self.bridge.pings += 1
+                self.bridge.cond.notify_all()
+            self._send(200, {"app": APP, "version": VERSION, "sites": list(SITES)}, origin)
+            return
+        if not self._authorized(origin):
+            return
+        if url.path == "/v1/job":
+            query = parse_qs(url.query)
+            site = (query.get("site") or [""])[0]
+            if site not in SITES:
+                self._send(400, {"error": "unknown site"}, origin)
+                return
+            with self.bridge.cond:
+                self.bridge.polls.add(site)
+                self.bridge.cond.notify_all()
+            try:
+                wait = float((query.get("wait") or ["2"])[0])
+            except ValueError:
+                wait = 2.0
+            job = self.bridge.take(site, min(max(wait, 0.0), 25.0))
+            if job is None:
+                self._send(204, None, origin)
+                return
+            self._send(
+                200,
+                {
+                    "id": job.id,
+                    "site": site,
+                    "prompt": job.prompt,
+                    "new_chat": job.new_chat,
+                    "inspect": job.inspect,
+                    "timeout_ms": int(job.timeout * 1000),
+                    "version": VERSION,
+                },
+                origin,
+            )
+            return
+        self._send(404, {"error": "not found"}, origin)
+
+    def do_POST(self) -> None:  # noqa: N802
+        origin = self._origin()
+        if origin is None:
+            return
+        if not self._authorized(origin):
+            return
+        url = urlparse(self.path)
+        parts = [part for part in url.path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "v1" and parts[1] == "job" and parts[3] in (
+            "progress",
+            "done",
+            "log",
+        ):
+            job_id, action = parts[2], parts[3]
+            payload = self._read_json()
+            if payload is None:
+                self._send(400, {"error": "invalid JSON body"}, origin)
+                return
+            if action == "log":
+                if self.bridge.verbose:
+                    sys.stderr.write(
+                        f"[page] {payload.get('level', 'info')}: {payload.get('message', '')}\n"
+                    )
+                self._send(200, {"ok": True}, origin)
+                return
+            if action == "progress":
+                ok = self.bridge.update(job_id, text=str(payload.get("text", "")))
+            else:
+                ok = self.bridge.update(
+                    job_id,
+                    text=str(payload.get("text", "")),
+                    error=payload.get("error") or None,
+                    meta=payload.get("meta") or None,
+                    state="done",
+                )
+            if not ok:
+                self._send(404, {"error": "unknown or finished job"}, origin)
+                return
+            self._send(200, {"ok": True}, origin)
+            return
+        self._send(404, {"error": "not found"}, origin)
+
+
+def start_bridge(
+    bridge: Bridge, base_port: int, span: int, bind: str = "127.0.0.1"
+) -> tuple[ThreadingHTTPServer, int]:
+    for port in range(base_port, base_port + span):
+        try:
+            server = ThreadingHTTPServer((bind, port), BridgeHandler)
+        except OSError:
+            continue
+        server.daemon_threads = True
+        BridgeHandler.bridge = bridge
+        threading.Thread(
+            target=server.serve_forever, name="termchat-bridge", daemon=True
+        ).start()
+        return server, port
+    raise SystemExit(
+        f"termchat: could not bind {bind} port in {base_port}..{base_port + span - 1}"
+    )
+
+
+# --------------------------------------------------------------------------
+# prompt gathering
+# --------------------------------------------------------------------------
+
+
+def read_file(path: str, read_stdin) -> tuple[str, str]:
+    if path == "-":
+        return "<stdin>", read_stdin()
+    file_path = Path(path)
+    data = file_path.read_bytes()
+    if b"\x00" in data[:8192]:
+        raise OSError(f"{path}: looks like a binary file")
+    return str(file_path), data.decode("utf-8", errors="replace")
+
+
+def compose_prompt(parts: list[str], files: list[tuple[str, str]]) -> str:
+    prompt = " ".join(part for part in parts if part).strip()
+    if not files:
+        return prompt
+    blocks: list[str] = []
+    for name, data in files:
+        if not data.endswith("\n"):
+            data += "\n"
+        blocks.append(f'<file path="{name}">\n{data}</file>')
+    if prompt:
+        blocks.append(prompt)
+    return "\n\n".join(blocks)
+
+
+def gather_prompt(args: argparse.Namespace) -> str:
+    stdin_used = False
+
+    def read_stdin() -> str:
+        nonlocal stdin_used
+        if stdin_used:
+            return ""
+        stdin_used = True
+        return sys.stdin.read()
+
+    files: list[tuple[str, str]] = []
+    for path in args.file:
+        files.append(read_file(path, read_stdin))
+
+    parts = list(args.prompt)
+    if parts == ["-"]:
+        parts = [read_stdin()]
+    elif (
+        not parts
+        and not args.interactive
+        and not args.inspect
+        and not stdin_used
+        and not sys.stdin.isatty()
+    ):
+        parts = [read_stdin()]
+
+    return compose_prompt(parts, files)
+
+
+# --------------------------------------------------------------------------
+# output
+# --------------------------------------------------------------------------
+
+
+def print_delta(text: str, printed: str, stream: bool) -> str:
+    if not stream or not text:
+        return printed
+    if text.startswith(printed):
+        if len(text) > len(printed):
+            sys.stdout.write(text[len(printed) :])
+            sys.stdout.flush()
+        return text
+    # The page rewrote earlier text; wait for the final version.
+    return printed
+
+
+def emit_final(text: str, printed: str, stream: bool) -> None:
+    if not stream:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+        sys.stdout.flush()
+        return
+    if text.startswith(printed):
+        rest = text[len(printed) :]
+    else:
+        rest = text
+        if printed and not printed.endswith("\n"):
+            sys.stdout.write("\n")
+    if rest:
+        sys.stdout.write(rest)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def save_diagnostics(job: Job) -> Path | None:
+    if not job.meta:
+        return None
+    try:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+        folder = base / "terminal-chat"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"job-{time.strftime('%Y%m%d-%H%M%S')}-{job.id[:8]}.json"
+        payload = {"site": job.site, "error": job.error, **job.meta}
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return path
+    except OSError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# running a job
+# --------------------------------------------------------------------------
+
+
+def wait_for_extension(bridge: Bridge, job: Job, timeout: float, site: str) -> bool:
+    start = time.monotonic()
+    warned = False
+    while True:
+        with bridge.cond:
+            if job.assigned:
+                return True
+        elapsed = time.monotonic() - start
+        if elapsed >= timeout:
+            return False
+        if bridge.verbose and not warned and elapsed > 2.0:
+            print(
+                f"termchat: waiting for the browser extension for {site}",
+                file=sys.stderr,
+            )
+            warned = True
+        time.sleep(0.1)
+
+
+def check_bridge(bridge: Bridge, bind: str, port: int, wait: float, site: str) -> int:
+    """Report how far the extension gets: reach the bridge, then poll a job."""
+    where = f"port {port}" if bind in ("0.0.0.0", "::") else f"{bind}:{port}"
+    print(
+        f"termchat: listening on {where}; waiting up to {wait:g}s for the extension",
+        file=sys.stderr,
+    )
+    deadline = time.monotonic() + wait
+    saw_ping = False
+    while True:
+        with bridge.cond:
+            polls = set(bridge.polls)
+            pings = bridge.pings
+        if polls:
+            print(
+                "termchat: the extension is polling for "
+                f"{', '.join(sorted(polls))}. The bridge is reachable.",
+                file=sys.stderr,
+            )
+            return 0
+        if pings and not saw_ping:
+            saw_ping = True
+            print(
+                "termchat: the extension reached the bridge; waiting for a chat tab "
+                f"on {SITE_ORIGINS.get(site, site)}.",
+                file=sys.stderr,
+            )
+        if time.monotonic() >= deadline:
+            break
+        with bridge.cond:
+            bridge.cond.wait(0.25)
+
+    if saw_ping:
+        print(
+            "termchat: the extension reached the bridge but never asked for a job. "
+            "Reload the chat tab.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "termchat: nothing reached the bridge. In the extension Options, set Host "
+        "to this machine, allow the permission, and check the network path.",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def run_job(
+    bridge: Bridge,
+    job: Job,
+    *,
+    timeout: float,
+    wait: float,
+    stream: bool,
+    json_mode: bool,
+    bridge_hint: str = "",
+) -> int:
+    bridge.submit(job)
+    if not wait_for_extension(bridge, job, wait, job.site):
+        where = f" (bridge on {bridge_hint})" if bridge_hint else ""
+        print(f"termchat: no browser tab picked up the job{where}.", file=sys.stderr)
+        print(
+            f"termchat: run 'termchat {job.site} --check' to see whether the "
+            "extension can reach this bridge.",
+            file=sys.stderr,
+        )
+        return 3
+
+    deadline = time.monotonic() + timeout + 30
+    printed = ""
+    state = job.state
+    text = job.text
+    error = job.error
+    meta = job.meta
+
+    while True:
+        with bridge.cond:
+            state, text, error, meta = job.state, job.text, job.error, job.meta
+        if state == "done":
+            break
+        if time.monotonic() > deadline:
+            error = f"timed out after {timeout:g}s waiting for the page"
+            break
+        if stream and text != printed:
+            printed = print_delta(text, printed, stream)
+        with bridge.cond:
+            bridge.cond.wait(0.2)
+
+    if job.inspect:
+        print(json.dumps(meta or {}, indent=2, ensure_ascii=False))
+        return 0 if state == "done" and not error else 1
+
+    if error:
+        if stream and printed:
+            sys.stdout.write("\n")
+        print(f"termchat: {error}", file=sys.stderr)
+        path = save_diagnostics(job)
+        if path is not None:
+            print(f"termchat: page diagnostics saved to {path}", file=sys.stderr)
+        if json_mode:
+            print(
+                json.dumps(
+                    {"site": job.site, "text": text or "", "error": error, "meta": meta},
+                    ensure_ascii=False,
+                )
+            )
+        return 1
+
+    final = text or ""
+    if json_mode:
+        print(
+            json.dumps(
+                {"site": job.site, "text": final, "error": None, "meta": meta},
+                ensure_ascii=False,
+            )
+        )
+    else:
+        emit_final(final, printed, stream)
+    return 0
+
+
+def interactive(
+    bridge: Bridge,
+    args: argparse.Namespace,
+    *,
+    timeout: float,
+    wait: float,
+    stream: bool,
+    bridge_hint: str = "",
+) -> int:
+    site = args.site
+    new_chat = not args.continue_chat
+    print(
+        f"termchat {site}: type a message (:help for commands, :quit to exit)",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            line = input(f"{site}> ")
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            return 0
+        if line.endswith("\\"):
+            chunks = [line[:-1]]
+            while True:
+                try:
+                    more = input("...> ")
+                except (EOFError, KeyboardInterrupt):
+                    print(file=sys.stderr)
+                    return 0
+                if more.endswith("\\"):
+                    chunks.append(more[:-1])
+                else:
+                    chunks.append(more)
+                    break
+            line = "\n".join(chunks)
+
+        command = line.strip()
+        if not command:
+            continue
+        if command in (":quit", ":q", ":exit"):
+            return 0
+        if command == ":help":
+            print(
+                "  :new       start the next message in a new chat\n"
+                "  :continue  keep using the open chat\n"
+                "  :inspect   dump what the extension can see on the page\n"
+                "  :quit      exit",
+                file=sys.stderr,
+            )
+            continue
+        if command == ":new":
+            new_chat = True
+            print("termchat: next message starts a new chat", file=sys.stderr)
+            continue
+        if command in (":continue", ":cont"):
+            new_chat = False
+            print("termchat: next message continues the open chat", file=sys.stderr)
+            continue
+        if command == ":inspect":
+            job = Job(site=site, prompt="", new_chat=False, inspect=True, timeout=timeout)
+            run_job(
+                bridge,
+                job,
+                timeout=timeout,
+                wait=wait,
+                stream=False,
+                json_mode=True,
+                bridge_hint=bridge_hint,
+            )
+            continue
+
+        job = Job(site=site, prompt=line, new_chat=new_chat, inspect=False, timeout=timeout)
+        new_chat = False
+        run_job(
+            bridge,
+            job,
+            timeout=timeout,
+            wait=wait,
+            stream=stream,
+            json_mode=args.json,
+            bridge_hint=bridge_hint,
+        )
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+
+def config_path() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "terminal-chat" / "config.json"
+
+
+def load_config() -> dict:
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def as_float(value: object, default: float) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def as_int(value: object, default: int) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="termchat",
+        description=(
+            "Talk to Gemini, Copilot or DeepSeek chat from the terminal through "
+            "your logged-in browser."
+        ),
+        epilog=(
+            "examples:\n"
+            "  termchat gemini 'Explain io_uring in two paragraphs'\n"
+            "  termchat copilot -f src/main.go 'Review this Go file'\n"
+            "  cat notes.md | termchat deepseek 'Summarise this'\n"
+            "  termchat gemini --continue 'And what about the error path?'\n"
+            "  termchat deepseek --inspect\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("site", choices=SITES)
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="prompt text; use '-' or pipe stdin to read it",
+    )
+    parser.add_argument(
+        "-f",
+        "--file",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="include a file's contents in the prompt (repeatable, '-' for stdin)",
+    )
+    parser.add_argument(
+        "--new",
+        action="store_true",
+        help="start a new chat (the default for a one-shot command)",
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_chat",
+        action="store_true",
+        help="use the chat already open in the tab",
+    )
+    parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="print what the extension sees on the page (for repairing selectors)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="wait for the extension, report how far it gets, then exit",
+    )
+    parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="read prompts in a small REPL",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=f"seconds to wait for an answer (default {DEFAULT_TIMEOUT:g})",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=None,
+        help=f"seconds to wait for the browser extension (default {DEFAULT_CONNECT_WAIT:g})",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print a JSON object instead of the answer text",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"base port (default {DEFAULT_BASE_PORT})",
+    )
+    parser.add_argument(
+        "--bind",
+        default=None,
+        metavar="ADDR",
+        help="address to listen on (default 127.0.0.1; e.g. 0.0.0.0 for a remote browser)",
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        metavar="TOKEN",
+        help="require this token from the extension (optional)",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="log bridge traffic")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.new and args.continue_chat:
+        parser.error("--new and --continue are mutually exclusive")
+
+    config = load_config()
+    base_port = args.port or as_int(
+        os.environ.get("TERMCHAT_BASE_PORT") or config.get("base_port"), DEFAULT_BASE_PORT
+    )
+    span = max(1, as_int(config.get("port_span"), DEFAULT_PORT_SPAN))
+    timeout = (
+        args.timeout
+        if args.timeout is not None
+        else as_float(config.get("timeout"), DEFAULT_TIMEOUT)
+    )
+    wait = (
+        args.wait
+        if args.wait is not None
+        else as_float(config.get("connect_wait"), DEFAULT_CONNECT_WAIT)
+    )
+    bind = (
+        args.bind
+        or os.environ.get("TERMCHAT_BIND")
+        or str(config.get("bind") or "127.0.0.1")
+    )
+    token = (
+        args.token
+        if args.token is not None
+        else os.environ.get("TERMCHAT_TOKEN") or str(config.get("token") or "")
+    )
+
+    if args.check:
+        prompt = ""
+    else:
+        try:
+            prompt = gather_prompt(args)
+        except OSError as exc:
+            print(f"termchat: {exc}", file=sys.stderr)
+            return 3
+
+    if not args.interactive and not args.inspect and not args.check and not prompt.strip():
+        parser.print_usage(sys.stderr)
+        print(
+            "termchat: give a prompt, pipe one in, or use -i/--inspect",
+            file=sys.stderr,
+        )
+        return 3
+
+    if len(prompt) > LARGE_PROMPT:
+        print(
+            f"termchat: prompt is large ({len(prompt):,} characters); "
+            "the site may truncate it",
+            file=sys.stderr,
+        )
+
+    bridge = Bridge(verbose=args.verbose, token=token)
+    server, port = start_bridge(bridge, base_port, span, bind)
+    if args.verbose:
+        print(f"termchat: bridge listening on http://{bind}:{port}", file=sys.stderr)
+        if not is_loopback_address(bind) and not token:
+            print(
+                f"termchat: no token; anyone who can reach "
+                f"http://{bind}:{port} can use the bridge",
+                file=sys.stderr,
+            )
+    bridge_hint = f"port {port}" if bind in ("0.0.0.0", "::") else f"{bind}:{port}"
+
+    stream = not args.json and sys.stdout.isatty()
+    try:
+        if args.check:
+            return check_bridge(bridge, bind, port, wait, args.site)
+        if args.interactive:
+            return interactive(
+                bridge,
+                args,
+                timeout=timeout,
+                wait=wait,
+                stream=stream,
+                bridge_hint=bridge_hint,
+            )
+        job = Job(
+            site=args.site,
+            prompt=prompt,
+            new_chat=not args.continue_chat,
+            inspect=args.inspect,
+            timeout=timeout,
+        )
+        return run_job(
+            bridge,
+            job,
+            timeout=timeout,
+            wait=wait,
+            stream=stream,
+            json_mode=args.json,
+            bridge_hint=bridge_hint,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
