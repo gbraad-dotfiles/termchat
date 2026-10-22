@@ -237,8 +237,9 @@ async function progress(port, job, text) {
   }
 }
 
-async function postDone(port, job, text, error, meta) {
+async function postDone(port, job, text, error, meta, markdown = '') {
   const payload = { text: text || '', error: error || null, meta: meta || null };
+  if (markdown) payload.markdown = markdown;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const reply = await request(`/v1/job/${job.id}/done`, 'POST', payload, port);
     if (reply.ok) return;
@@ -504,6 +505,7 @@ async function runJob(site, job, port, firstEntry) {
   const prompt = String(job.prompt || '');
   const wantNew = Boolean(job.new_chat);
   let lastText = '';
+  let lastMarkdown = '';
 
   try {
     if (job.inspect) {
@@ -594,6 +596,7 @@ async function runJob(site, job, port, firstEntry) {
       const isNewAnswer = text !== pre.last || Number(res.count) > Number(pre.count || 0);
       if (text && isNewAnswer) {
         sawNew = true;
+        lastMarkdown = String(res.markdown || '');
         if (text !== lastText) {
           lastText = text;
           stableAt = Date.now();
@@ -632,11 +635,18 @@ async function runJob(site, job, port, firstEntry) {
           }
           if (tidy(confirm.text || '') === lastText) {
             await resetTab(site);
-            await postDone(port, job, lastText, null, {
-              site,
-              duration_ms: Date.now() - startedAt,
-              version: VERSION,
-            });
+            await postDone(
+              port,
+              job,
+              lastText,
+              null,
+              {
+                site,
+                duration_ms: Date.now() - startedAt,
+                version: VERSION,
+              },
+              String(confirm.markdown || lastMarkdown)
+            );
             return;
           }
           stableAt = Date.now();
@@ -648,11 +658,18 @@ async function runJob(site, job, port, firstEntry) {
 
     if (lastText) {
       await resetTab(site);
-      await postDone(port, job, lastText, null, {
-        site,
-        duration_ms: Date.now() - startedAt,
-        version: VERSION,
-      });
+      await postDone(
+        port,
+        job,
+        lastText,
+        null,
+        {
+          site,
+          duration_ms: Date.now() - startedAt,
+          version: VERSION,
+        },
+        lastMarkdown
+      );
       return;
     }
     throw new Error('timed out waiting for an answer');
@@ -664,6 +681,13 @@ async function runJob(site, job, port, firstEntry) {
       inspect: await safeInspect(pickEntry(site)),
     };
     await resetTab(site);
-    await postDone(port, job, lastText, String((err && err.message) || err), meta);
+    await postDone(
+      port,
+      job,
+      lastText,
+      String((err && err.message) || err),
+      meta,
+      lastMarkdown
+    );
   }
 }

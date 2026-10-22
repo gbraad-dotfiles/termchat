@@ -10,7 +10,9 @@ const path = require('path');
 const vm = require('vm');
 
 const realFetch = globalThis.fetch;
-const repeated = process.argv[2] === 'repeat';
+const mode = process.argv[2] || '';
+const repeated = mode === 'repeat';
+const withMarkdown = mode === 'markdown';
 let sawDone = false;
 let statusCalls = 0;
 
@@ -92,6 +94,7 @@ const port = {
         const text = frames[Math.min(statusCalls, frames.length - 1)];
         reply = {
           text,
+          markdown: withMarkdown && text ? `**${text}**` : '',
           count: repeated ? 2 : statusCalls >= 2 ? 1 : 0,
           stop: statusCalls < frames.length,
           promptInComposer: false,

@@ -14,6 +14,8 @@ import hmac
 import ipaddress
 import json
 import os
+import re
+import shutil
 import sys
 import threading
 import time
@@ -56,6 +58,7 @@ class Job:
     timeout: float
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     text: str = ""
+    markdown: str | None = None
     error: str | None = None
     meta: dict | None = None
     state: str = "pending"  # pending | running | done
@@ -149,6 +152,7 @@ class Bridge:
         error: str | None = None,
         meta: dict | None = None,
         state: str | None = None,
+        markdown: str | None = None,
     ) -> bool:
         with self.cond:
             job = self.active.get(job_id)
@@ -156,6 +160,8 @@ class Bridge:
                 return False
             if text is not None:
                 job.text = text
+            if markdown is not None:
+                job.markdown = markdown
             if error is not None:
                 job.error = error
             if meta is not None:
@@ -204,6 +210,7 @@ class Bridge:
             "site": job.site,
             "state": job.state,
             "text": job.text,
+            "markdown": job.markdown,
             "error": job.error,
             "meta": job.meta,
             "inspect": job.inspect,
@@ -466,9 +473,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if action == "progress":
                 ok = self.bridge.update(job_id, text=str(payload.get("text", "")))
             else:
+                markdown = payload.get("markdown")
                 ok = self.bridge.update(
                     job_id,
                     text=str(payload.get("text", "")),
+                    markdown=markdown if isinstance(markdown, str) else None,
                     error=payload.get("error") or None,
                     meta=payload.get("meta") or None,
                     state="done",
@@ -728,6 +737,165 @@ def gather_prompt(args: argparse.Namespace) -> str:
 # --------------------------------------------------------------------------
 
 
+RESET = "\x1b[0m"
+
+
+def _style(text: str, *codes: str, color: bool) -> str:
+    if not color or not text:
+        return text
+    return "".join(codes) + text + RESET
+
+
+def render_inline(text: str, color: bool) -> str:
+    """Apply inline Markdown styling, leaving the words themselves alone."""
+    stash: list[str] = []
+
+    def hold(value: str) -> str:
+        stash.append(value)
+        return f"\x00{len(stash) - 1}\x00"
+
+    def inline_code(match: re.Match[str]) -> str:
+        value = " ".join(match.group(2).split())
+        return hold(_style(value, "\x1b[36m", color=color))
+
+    def link(match: re.Match[str]) -> str:
+        label, url = match.group(1), match.group(2)
+        if not url.startswith(("http://", "https://", "mailto:")):
+            return hold(label)
+        if url == label:
+            return hold(_style(label, "\x1b[4m", color=color))
+        shown = _style(url, "\x1b[2;4m", color=color)
+        return hold(f"{label} ({shown})")
+
+    work = re.sub(r"(`+)(.+?)\1", inline_code, text)
+    work = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", link, work)
+    work = re.sub(
+        r"\*\*\*(.+?)\*\*\*",
+        lambda m: _style(m.group(1), "\x1b[1m", "\x1b[3m", color=color),
+        work,
+    )
+    work = re.sub(
+        r"\*\*(.+?)\*\*",
+        lambda m: _style(m.group(1), "\x1b[1m", color=color),
+        work,
+    )
+    work = re.sub(
+        r"(?<![\w_])__(.+?)__(?![\w_])",
+        lambda m: _style(m.group(1), "\x1b[1m", color=color),
+        work,
+    )
+    work = re.sub(
+        r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
+        lambda m: _style(m.group(1), "\x1b[3m", color=color),
+        work,
+    )
+    work = re.sub(
+        r"(?<![\w_])_(?!_)(.+?)(?<!_)_(?![\w_])",
+        lambda m: _style(m.group(1), "\x1b[3m", color=color),
+        work,
+    )
+    work = re.sub(
+        r"~~(.+?)~~",
+        lambda m: _style(m.group(1), "\x1b[9m", color=color),
+        work,
+    )
+    if stash:
+        work = re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], work)
+    return work
+
+
+def render_markdown(markdown: str, color: bool = True, width: int = 0) -> str:
+    """Render Markdown for a terminal without reflowing it.
+
+    Text and code keep their line breaks; styling is added around them. Code
+    blocks keep their exact contents (only indented), so columns and layout
+    survive.
+    """
+    if not width:
+        width = min(shutil.get_terminal_size((80, 24)).columns, 72)
+    lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: list[str] = []
+    fence: list[str] | None = None
+
+    def flush_fence() -> None:
+        nonlocal fence
+        if fence is None:
+            return
+        for code_line in fence:
+            out.append("  " + _style(code_line, "\x1b[36m", color=color))
+        fence = None
+
+    for raw in lines:
+        opener = re.match(r"^\s*```(.*)$", raw)
+        if opener:
+            if fence is None:
+                fence = []
+            else:
+                flush_fence()
+            continue
+        if fence is not None:
+            fence.append(raw)
+            continue
+
+        line = raw.rstrip()
+        if not line.strip():
+            if out and out[-1] != "":
+                out.append("")
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if heading:
+            level = len(heading.group(1))
+            text = render_inline(heading.group(2), color)
+            if level == 1:
+                out.append(_style(text, "\x1b[1m", "\x1b[4m", "\x1b[36m", color=color))
+            elif level == 2:
+                out.append(_style(text, "\x1b[1m", "\x1b[36m", color=color))
+            elif level == 3:
+                out.append(_style(text, "\x1b[1m", "\x1b[34m", color=color))
+            else:
+                out.append(_style(text, "\x1b[1m", color=color))
+            continue
+
+        if re.match(r"^\s*([-*_])(\s*\1){2,}\s*$", line):
+            out.append(_style("─" * width, "\x1b[2m", color=color))
+            continue
+
+        quote = re.match(r"^\s*>\s?(.*)$", line)
+        if quote:
+            out.append(
+                _style("│ ", "\x1b[2m", color=color)
+                + render_inline(quote.group(1), color)
+            )
+            continue
+
+        item = re.match(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$", line)
+        if item:
+            indent, marker, body = item.groups()
+            task = re.match(r"\[([ xX])\]\s+(.*)", body)
+            if task:
+                box = "☑" if task.group(1).lower() == "x" else "☐"
+                marker_text = _style(box, "\x1b[33m", color=color)
+                body = task.group(2)
+            elif marker in "-*+":
+                marker_text = _style("•", "\x1b[33m", color=color)
+            else:
+                marker_text = _style(marker, "\x1b[33m", color=color)
+            out.append(f"{indent}{marker_text} {render_inline(body, color)}")
+            continue
+
+        if line.lstrip().startswith("|") and re.match(r"^\s*\|[\s:|-]+\|\s*$", line):
+            out.append(_style(line, "\x1b[2m", color=color))
+            continue
+
+        out.append(render_inline(line, color))
+
+    flush_fence()
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
+
+
 def print_delta(text: str, printed: str, stream: bool) -> str:
     if not stream or not text:
         return printed
@@ -757,6 +925,27 @@ def emit_final(text: str, printed: str, stream: bool) -> None:
         sys.stdout.write(rest)
     if not text.endswith("\n"):
         sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def emit_answer(
+    text: str,
+    markdown: str | None,
+    printed: str,
+    *,
+    stream: bool,
+    styled: bool,
+    color: bool,
+) -> None:
+    if not styled:
+        emit_final(text, printed, stream)
+        return
+    body = (markdown or "").strip() or text
+    rendered = render_markdown(body, color=color)
+    if rendered:
+        sys.stdout.write(rendered)
+        if not rendered.endswith("\n"):
+            sys.stdout.write("\n")
     sys.stdout.flush()
 
 
@@ -855,6 +1044,8 @@ def run_job(
     stream: bool,
     json_mode: bool,
     bridge_hint: str = "",
+    styled: bool = False,
+    color: bool = True,
 ) -> int:
     bridge.submit(job)
     if not wait_for_extension(bridge, job, wait, job.site):
@@ -871,12 +1062,14 @@ def run_job(
     printed = ""
     state = job.state
     text = job.text
+    markdown = job.markdown
     error = job.error
     meta = job.meta
 
     while True:
         with bridge.cond:
             state, text, error, meta = job.state, job.text, job.error, job.meta
+            markdown = job.markdown
         if state == "done":
             break
         if time.monotonic() > deadline:
@@ -916,7 +1109,14 @@ def run_job(
             )
         )
     else:
-        emit_final(final, printed, stream)
+        emit_answer(
+            final,
+            markdown,
+            printed,
+            stream=stream,
+            styled=styled,
+            color=color,
+        )
     return 0
 
 
@@ -928,6 +1128,8 @@ def run_remote(
     wait: float,
     stream: bool,
     json_mode: bool,
+    styled: bool = False,
+    color: bool = True,
 ) -> int:
     try:
         job_id = remote.submit(job)
@@ -943,6 +1145,7 @@ def run_remote(
     picked = False
     state = "pending"
     text = ""
+    markdown: str | None = None
     error: str | None = None
     meta: dict | None = None
 
@@ -963,6 +1166,8 @@ def run_remote(
             after = int(snap.get("seq", after))
             state = str(snap.get("state") or state)
             text = str(snap.get("text") or "")
+            if isinstance(snap.get("markdown"), str):
+                markdown = snap["markdown"]
             error = snap.get("error") or None
             meta = snap.get("meta") or None
             if state in ("running", "done"):
@@ -1040,7 +1245,14 @@ def run_remote(
             )
         )
     else:
-        emit_final(final, printed, stream)
+        emit_answer(
+            final,
+            markdown,
+            printed,
+            stream=stream,
+            styled=styled,
+            color=color,
+        )
     return 0
 
 
@@ -1053,6 +1265,8 @@ def interactive(
     stream: bool,
     bridge_hint: str = "",
     remote: RemoteClient | None = None,
+    styled: bool = False,
+    color: bool = True,
 ) -> int:
     site = args.site
     new_chat = not args.continue_chat
@@ -1129,6 +1343,8 @@ def interactive(
                 wait=wait,
                 stream=stream,
                 json_mode=args.json,
+                styled=styled,
+                color=color,
             )
         else:
             run_job(
@@ -1139,6 +1355,8 @@ def interactive(
                 stream=stream,
                 json_mode=args.json,
                 bridge_hint=bridge_hint,
+                styled=styled,
+                color=color,
             )
 
 
@@ -1329,6 +1547,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="print a JSON object instead of the answer text",
     )
     parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="print the answer as plain text, without Markdown styling",
+    )
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="render Markdown styling even when stdout is not a terminal",
+    )
+    parser.add_argument(
         "--server",
         default=None,
         metavar="URL",
@@ -1376,6 +1604,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--new and --continue are mutually exclusive")
     if args.local and args.server:
         parser.error("--server and --local are mutually exclusive")
+    if args.plain and args.markdown:
+        parser.error("--plain and --markdown are mutually exclusive")
 
     config = load_config()
     base_port = args.port or as_int(
@@ -1445,14 +1675,28 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    stream = not args.json and sys.stdout.isatty()
+    styled = (
+        not args.json
+        and not args.inspect
+        and not args.plain
+        and (args.markdown or sys.stdout.isatty())
+    )
+    color = styled and "NO_COLOR" not in os.environ
+    stream = not args.json and not styled and sys.stdout.isatty()
 
     if remote is not None:
         if args.check:
             return check_remote(remote, args.site, wait, args.verbose)
         if args.interactive:
             return interactive(
-                None, args, timeout=timeout, wait=wait, stream=stream, remote=remote
+                None,
+                args,
+                timeout=timeout,
+                wait=wait,
+                stream=stream,
+                remote=remote,
+                styled=styled,
+                color=color,
             )
         job = Job(
             site=args.site,
@@ -1468,6 +1712,8 @@ def main(argv: list[str] | None = None) -> int:
             wait=wait,
             stream=stream,
             json_mode=args.json,
+            styled=styled,
+            color=color,
         )
 
     bridge = Bridge(verbose=args.verbose, token=token)
@@ -1493,6 +1739,8 @@ def main(argv: list[str] | None = None) -> int:
                 wait=wait,
                 stream=stream,
                 bridge_hint=bridge_hint,
+                styled=styled,
+                color=color,
             )
         job = Job(
             site=args.site,
@@ -1509,6 +1757,8 @@ def main(argv: list[str] | None = None) -> int:
             stream=stream,
             json_mode=args.json,
             bridge_hint=bridge_hint,
+            styled=styled,
+            color=color,
         )
     finally:
         server.shutdown()

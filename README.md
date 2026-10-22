@@ -102,8 +102,14 @@ one thread. Use `--continue` to append to the open conversation instead. New
 chat is best-effort: if the button cannot be found, the prompt is typed into
 the conversation that is already open.
 
-Answers stream to the terminal when stdout is a TTY. When piped, only the final
-text is printed, so `termchat … > answer.md` works as expected.
+Answers are styled for the terminal when stdout is a TTY: the extension reads
+the answer's structure (headings, lists, code blocks, emphasis, tables) and the
+CLI renders it without reflowing the text, so code and tables keep their
+layout. Styled answers are printed once, when they are complete. Use `--plain`
+to stream the raw text instead (the old behaviour), `NO_COLOR=1` to keep the
+layout but drop the colours, or `--markdown` to force styling when stdout is
+not a terminal. When piped, the plain final text is printed, so
+`termchat … > answer.md` works as expected.
 
 
 ### Options
@@ -118,6 +124,8 @@ text is printed, so `termchat … > answer.md` works as expected.
 | `--timeout SEC` | how long to wait for an answer (default 300) |
 | `--wait SEC` | how long to wait for the extension to pick the job up (default 30) |
 | `--json` | print `{site, text, error, meta}` |
+| `--plain` | print the raw text and stream it (no Markdown styling) |
+| `--markdown` | render Markdown styling even when stdout is not a TTY |
 | `--server URL` | submit to a running `termchat serve` (`host[:port]`) |
 | `--local` | always start a private bridge, ignoring a running server |
 | `--port N` | base loopback port (default 8765) |
@@ -179,8 +187,9 @@ Notes:
    range with `/v1/ping`) and long-polls `/v1/job` for open chat tabs.
 3. For each job the worker drives a small state machine through the content
    script: `prepare` (new chat + type the prompt), `submit` (send button, or
-   Enter), `status` (current answer text, stop button). Partial answers go back
-   to the CLI via `/progress`; the final one via `/done`.
+   Enter), `status` (current answer text, Markdown, stop button). Partial
+   answers go back to the CLI via `/progress`; the final one, with its
+   Markdown, via `/done`.
 4. Timing and polling live in the **service worker**, not the page. Browsers
    throttle timers in hidden tabs (down to once per minute), which would make
    this unusable while you are in the terminal; message delivery is not
@@ -272,6 +281,10 @@ ssh -N "${args[@]}" you@cli-machine
   queue; with per-command bridges, concurrent calls on different sites are fine.
 - Text only; file *attachments* (images/PDF) are not uploaded — file contents
   are included in the prompt text instead.
+- Styled output is not streamed: the answer appears when it is complete. Use
+  `--plain` if you prefer to watch it arrive.
+- Markdown is reconstructed from the page's HTML. Unusual site markup can lose
+  a marker or a table alignment; the words themselves are unaffected.
 - These are consumer web UIs without a stable API. Selectors will occasionally
   need a one-line repair; `--inspect` makes that quick.
 - The extension types into your real session, so it can do anything you could

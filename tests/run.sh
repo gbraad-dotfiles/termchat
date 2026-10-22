@@ -244,4 +244,59 @@ else
   sed 's/^/     /' "$tmp/bridge.err"
 fi
 
+# 17. Markdown renderer
+if python3 tests/markdown_test.py >/dev/null 2>"$tmp/markdown.err"; then
+  ok "markdown renderer"
+else
+  bad "markdown renderer"
+  sed 's/^/     /' "$tmp/markdown.err"
+fi
+
+# 18. answer DOM -> Markdown
+if node tests/content_test.js >/dev/null 2>"$tmp/content.err"; then
+  ok "answer markdown extraction"
+else
+  bad "answer markdown extraction"
+  sed 's/^/     /' "$tmp/content.err"
+fi
+
+# 19. the extension's Markdown reaches the terminal; --plain ignores it
+md=$'# Title\n\nSome **bold** text.\n\n```sh\necho hi\n```\n'
+esc="$(printf '\033')"
+python3 tests/fake_extension.py gemini --reply @echo --markdown "$md" --timeout 8 &
+fake=$!
+out="$(tc gemini "plain fallback" --markdown --wait 5 --timeout 10)"
+wait "$fake" || true
+if printf '%s' "$out" | grep -Fq "${esc}[1m${esc}[4m${esc}[36mTitle${esc}[0m" \
+  && printf '%s' "$out" | grep -Fq "${esc}[1mbold${esc}[0m" \
+  && printf '%s' "$out" | grep -Fq "  ${esc}[36mecho hi${esc}[0m"; then
+  ok "markdown end to end"
+else
+  bad "markdown end to end: $out"
+fi
+
+python3 tests/fake_extension.py gemini --reply @echo --markdown "$md" --timeout 8 &
+fake=$!
+plain="$(tc gemini "plain fallback" --plain --wait 5 --timeout 10)"
+wait "$fake" || true
+if [[ "$plain" == "plain fallback" ]]; then
+  ok "markdown --plain"
+else
+  bad "markdown --plain: got '$plain'"
+fi
+
+# 20. the worker forwards the content script's Markdown to the CLI
+node tests/sw_harness.js markdown >"$tmp/sw3.log" 2>&1 &
+sw=$!
+sleep 1
+out="$(tc gemini "hi" --markdown --wait 10 --timeout 20)"
+wait "$sw"
+sw_code=$?
+if [[ $sw_code -eq 0 ]] && printf '%s' "$out" | grep -Fq "${esc}[1mHello world${esc}[0m"; then
+  ok "worker forwards markdown"
+else
+  bad "worker forwards markdown (exit $sw_code, output '$out')"
+  sed 's/^/     /' "$tmp/sw3.log"
+fi
+
 exit $status

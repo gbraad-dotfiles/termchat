@@ -51,6 +51,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("site")
     parser.add_argument("--reply", default="Hello from the fake extension.")
+    parser.add_argument(
+        "--markdown",
+        default="",
+        help="Markdown body to include with the final answer",
+    )
     parser.add_argument("--chunks", type=int, default=3)
     parser.add_argument("--delay", type=float, default=0.04)
     parser.add_argument("--dump-prompt", metavar="PATH")
@@ -127,7 +132,12 @@ def main() -> int:
             port,
             f"/v1/job/{job['id']}/done",
             "POST",
-            {"text": reply, "error": None, "meta": {"fake": True}},
+            {
+                "text": reply,
+                "markdown": args.markdown or None,
+                "error": None,
+                "meta": {"fake": True},
+            },
         )
 
     return 0

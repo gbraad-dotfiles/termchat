@@ -229,6 +229,323 @@
       .trim();
   }
 
+  /* ------------------------------------------------------------------ */
+  /* answer -> Markdown                                                 */
+  /* ------------------------------------------------------------------ */
+
+  // The page renders Markdown to HTML before we see it. Walk that HTML back
+  // to Markdown so the CLI can keep the answer's structure (headings, lists,
+  // code blocks, emphasis) instead of flattening it to plain text.
+  const MD_SKIP =
+    /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|SVG|PATH|BUTTON|INPUT|TEXTAREA|SELECT|OPTION|MAT-ICON|VECTOR|USE)$/;
+  const MD_BLOCK =
+    /^(ADDRESS|ARTICLE|ASIDE|DIV|DL|DD|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|HEADER|LI|MAIN|NAV|OL|P|SECTION|UL)$/;
+
+  function mdHidden(el) {
+    if (el.hidden) return true;
+    if (el.getAttribute('aria-hidden') === 'true') return true;
+    const cls = el.getAttribute('class') || '';
+    return /\b(hidden|sr-only|visually-hidden)\b/.test(cls);
+  }
+
+  function mdCodeText(node) {
+    if (!node.shadowRoot) return node.innerText ?? node.textContent ?? '';
+    let out = '';
+    const walk = (n) => {
+      if (n.nodeType === Node.TEXT_NODE) {
+        out += n.textContent || '';
+        return;
+      }
+      if (n.nodeType !== Node.ELEMENT_NODE) return;
+      if (n.tagName === 'BR') {
+        out += '\n';
+        return;
+      }
+      const kids = n.shadowRoot ? n.shadowRoot.childNodes : n.childNodes;
+      for (const child of kids) walk(child);
+    };
+    walk(node);
+    return out;
+  }
+
+  function mdLanguage(node) {
+    for (const el of [node, ...node.querySelectorAll('*')].slice(0, 30)) {
+      for (const attr of ['data-language', 'data-lang']) {
+        const value = el.getAttribute(attr);
+        if (value) return String(value).trim().split(/\s+/)[0];
+      }
+      const match = /(?:language|lang)-([\w#+.-]+)/.exec(el.getAttribute('class') || '');
+      if (match) return match[1];
+    }
+    return '';
+  }
+
+  function mdFind(node, tag) {
+    const kids = node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+    for (const child of kids) {
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      if (child.tagName === tag) return child;
+      const found = mdFind(child, tag);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function tidyMarkdown(markdown) {
+    const lines = String(markdown || '')
+      .replace(/\u00a0/g, ' ')
+      .split('\n');
+    const out = [];
+    let fence = false;
+    let blanks = 0;
+    for (let line of lines) {
+      if (/^\s*```/.test(line)) {
+        fence = !fence;
+        blanks = 0;
+        out.push(line.replace(/[ \t]+$/, ''));
+        continue;
+      }
+      if (fence) {
+        out.push(line);
+        continue;
+      }
+      line = line.replace(/[ \t]+$/, '');
+      if (!line.trim()) {
+        blanks += 1;
+        if (blanks <= 1) out.push('');
+        continue;
+      }
+      blanks = 0;
+      out.push(line);
+    }
+    while (out.length && !out[0].trim()) out.shift();
+    while (out.length && !out[out.length - 1].trim()) out.pop();
+    return out.join('\n');
+  }
+
+  function deepMarkdown(el) {
+    if (!el) return '';
+    const chunks = [];
+    const push = (value) => {
+      if (value) chunks.push(value);
+    };
+    const lineBreaks = (count) => {
+      const last = chunks.length ? chunks[chunks.length - 1] : '';
+      const have = (last.match(/\n*$/) || [''])[0].length;
+      if (have < count) push('\n'.repeat(count - have));
+    };
+    const capture = (fn) => {
+      const start = chunks.length;
+      fn();
+      return chunks.splice(start).join('');
+    };
+    const words = (value) => {
+      const clean = String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ');
+      if (!clean.trim()) {
+        if (clean && chunks.length) push(' ');
+        return;
+      }
+      push(clean);
+    };
+    const emphasis = (node, marker, depth) => {
+      const raw = capture(() => renderChildren(node, depth));
+      const body = raw.trim();
+      if (!body) return;
+      push((/^\s/.test(raw) ? ' ' : '') + marker + body + marker + (/\s$/.test(raw) ? ' ' : ''));
+    };
+    const table = (node) => {
+      const rows = [];
+      for (const tr of node.querySelectorAll('tr')) {
+        const cells = [...tr.children].filter((cell) =>
+          /^(TD|TH)$/.test(cell.tagName)
+        );
+        if (!cells.length) continue;
+        rows.push(cells.map((cell) => flat(deepText(cell)).replace(/\|/g, '\\|')));
+      }
+      if (!rows.length) return;
+      const columns = Math.max(...rows.map((row) => row.length));
+      lineBreaks(2);
+      rows.forEach((row, index) => {
+        while (row.length < columns) row.push('');
+        push(`| ${row.join(' | ')} |`);
+        lineBreaks(1);
+        if (index === 0) {
+          push(`| ${row.map(() => '---').join(' | ')} |`);
+          lineBreaks(1);
+        }
+      });
+      lineBreaks(2);
+    };
+
+    function renderChildren(parent, depth) {
+      const kids = parent.shadowRoot ? parent.shadowRoot.childNodes : parent.childNodes;
+      for (const child of kids) render(child, depth);
+    }
+
+    function render(node, depth) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        words(node.textContent);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      if (MD_SKIP.test(node.tagName) || mdHidden(node)) return;
+
+      const tag = node.tagName;
+
+      if (tag === 'BR') {
+        push('\n');
+        return;
+      }
+
+      // Gemini wraps code in a custom element whose header holds the language
+      // and a copy button. Render only the pre it contains.
+      if (/^CODE-?BLOCK$/.test(tag)) {
+        const pre = mdFind(node, 'PRE');
+        if (pre) {
+          render(pre, depth);
+          return;
+        }
+      }
+
+      if (/^H[1-6]$/.test(tag)) {
+        const level = Number(tag[1]);
+        lineBreaks(2);
+        push('#'.repeat(level) + ' ');
+        renderChildren(node, depth);
+        lineBreaks(2);
+        return;
+      }
+
+      if (tag === 'PRE') {
+        const code = mdFind(node, 'CODE') || node;
+        const language = mdLanguage(node) || mdLanguage(code);
+        const body = mdCodeText(code).replace(/\n+$/, '');
+        lineBreaks(2);
+        push('```' + language + '\n' + body);
+        lineBreaks(1);
+        push('```');
+        lineBreaks(2);
+        return;
+      }
+
+      if (tag === 'CODE') {
+        const value = String(node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!value) return;
+        let longest = 0;
+        for (const run of value.match(/`+/g) || []) longest = Math.max(longest, run.length);
+        const ticks = '`'.repeat(longest + 1);
+        push(ticks + value + ticks);
+        return;
+      }
+
+      if (tag === 'STRONG' || tag === 'B') {
+        emphasis(node, '**', depth);
+        return;
+      }
+      if (tag === 'EM' || tag === 'I') {
+        emphasis(node, '*', depth);
+        return;
+      }
+      if (tag === 'DEL' || tag === 'S' || tag === 'STRIKE') {
+        emphasis(node, '~~', depth);
+        return;
+      }
+
+      if (tag === 'A') {
+        const href = node.getAttribute('href') || '';
+        const raw = capture(() => renderChildren(node, depth));
+        const label = raw.trim() || href;
+        if (!label) return;
+        if (!/^(https?:|mailto:)/i.test(href)) {
+          push((/^\s/.test(raw) ? ' ' : '') + label);
+          return;
+        }
+        push((/^\s/.test(raw) ? ' ' : '') + `[${label}](${href})`);
+        if (/\s$/.test(raw)) push(' ');
+        return;
+      }
+
+      if (tag === 'LI') {
+        lineBreaks(1);
+        let marker = '- ';
+        const parent = node.parentElement;
+        if (parent && parent.tagName === 'OL') {
+          const items = [...parent.children].filter((item) => item.tagName === 'LI');
+          const start = Number(parent.getAttribute('start') || 1) || 1;
+          marker = `${start + items.indexOf(node)}. `;
+        }
+        push('  '.repeat(depth) + marker);
+        const kids = node.shadowRoot ? node.shadowRoot.childNodes : node.childNodes;
+        for (const child of kids) {
+          if (
+            child.nodeType === Node.ELEMENT_NODE &&
+            (child.tagName === 'UL' || child.tagName === 'OL')
+          ) {
+            render(child, depth + 1);
+          } else {
+            render(child, depth);
+          }
+        }
+        lineBreaks(1);
+        return;
+      }
+
+      if (tag === 'UL' || tag === 'OL') {
+        lineBreaks(1);
+        renderChildren(node, depth);
+        lineBreaks(2);
+        return;
+      }
+
+      if (tag === 'BLOCKQUOTE') {
+        lineBreaks(2);
+        const body = capture(() => renderChildren(node, depth)).trim();
+        if (body) {
+          push(
+            body
+              .split('\n')
+              .map((line) => '> ' + line)
+              .join('\n')
+          );
+        }
+        lineBreaks(2);
+        return;
+      }
+
+      if (tag === 'TABLE') {
+        table(node);
+        return;
+      }
+
+      if (tag === 'HR') {
+        lineBreaks(2);
+        push('---');
+        lineBreaks(2);
+        return;
+      }
+
+      if (tag === 'P') {
+        lineBreaks(node.parentElement && node.parentElement.tagName === 'LI' ? 0 : 2);
+        renderChildren(node, depth);
+        lineBreaks(node.parentElement && node.parentElement.tagName === 'LI' ? 0 : 2);
+        return;
+      }
+
+      // Custom elements often carry their content in a shadow root.
+      if (node.shadowRoot) {
+        renderChildren(node, depth);
+        if (MD_BLOCK.test(tag)) lineBreaks(1);
+        return;
+      }
+
+      for (const child of node.childNodes) render(child, depth);
+      if (MD_BLOCK.test(tag)) lineBreaks(1);
+    }
+
+    render(el, 0);
+    return tidyMarkdown(chunks.join(''));
+  }
+
   function flat(text) {
     return tidy(text).replace(/\s+/g, ' ').trim();
   }
@@ -529,6 +846,7 @@
       state.composer && state.composer.isConnected ? state.composer : findComposer();
     return {
       text: response ? tidy(deepText(response)) : '',
+      markdown: response ? deepMarkdown(response) : '',
       count: responses.length,
       stop: Boolean(findStopButton()),
       promptInComposer: composer ? composerHas(composer, state.prompt) : false,
@@ -629,6 +947,12 @@
   /* ------------------------------------------------------------------ */
   /* connection                                                          */
   /* ------------------------------------------------------------------ */
+
+  // tests/content_test.js loads this file with a tiny fake DOM and calls the
+  // serializer directly. Inert in a real tab.
+  if (globalThis.__TERMCHAT_TEST__) {
+    globalThis.__termchatTest = { deepMarkdown, tidyMarkdown };
+  }
 
   function connect() {
     if (state.port) return;
