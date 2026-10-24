@@ -9,6 +9,7 @@ import types
 
 def load():
     module = types.ModuleType("tc")
+    module.__file__ = "bin/termchat"
     sys.modules["tc"] = module
     with open("bin/termchat", encoding="utf-8") as handle:
         exec(compile(handle.read(), "bin/termchat", "exec"), module.__dict__)

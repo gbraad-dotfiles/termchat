@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>termchat</title>
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23CF1A37'/%3E%3Cpath d='M8 10h16M16 10v13' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="top-banner">
+  <div class="banner-title">termchat</div>
+  <nav class="site-tabs" id="site-tabs" role="tablist" aria-label="Chat site">
+    <button class="site-tab" type="button" role="tab" aria-selected="true" data-site="gemini">Gemini</button>
+    <button class="site-tab" type="button" role="tab" aria-selected="false" data-site="copilot">Copilot</button>
+    <button class="site-tab" type="button" role="tab" aria-selected="false" data-site="deepseek">DeepSeek</button>
+  </nav>
+  <div class="status" id="status" title="Extension connection">
+    <span class="dot" id="status-dot"></span>
+    <span id="status-text">connecting</span>
+    <span class="status-version" id="status-version"></span>
+  </div>
+</header>
+
+<main id="main">
+  <section class="thread" id="thread" role="tabpanel" aria-label="Conversation"></section>
+
+  <section class="empty" id="empty">
+    <div class="empty-mark" aria-hidden="true">&gt;_</div>
+    <h1>Ask from the browser</h1>
+    <p>Your prompt goes to the chat tab that is already signed in. Nothing is sent through an API.</p>
+    <div class="chips">
+      <button class="chip" type="button" data-prompt="Summarise this error message: ">Summarise an error</button>
+      <button class="chip" type="button" data-prompt="Write a unit test for this function: &#10;&#10;">Write a test</button>
+      <button class="chip" type="button" data-prompt="Explain this code step by step: &#10;&#10;">Explain code</button>
+    </div>
+  </section>
+</main>
+
+<footer class="composer-wrap">
+  <div class="meta-row">
+    <label class="toggle" title="Start a fresh conversation for the next prompt">
+      <input type="checkbox" id="new-chat" checked>
+      <span>New chat</span>
+    </label>
+    <span class="hint" id="hint">Enter to send, Shift+Enter for a new line</span>
+    <button class="link" id="token-button" type="button" hidden>Token</button>
+  </div>
+  <form class="composer" id="composer">
+    <textarea id="prompt" rows="1" placeholder="Ask Gemini..." aria-label="Prompt" autocomplete="off"></textarea>
+    <button class="send" id="send" type="submit">Send</button>
+  </form>
+</footer>
+
+<dialog id="token-dialog" class="token-dialog">
+  <form method="dialog" id="token-form">
+    <h2>Access token</h2>
+    <p>The server requires a token. Paste the value passed to <code>termchat serve --token</code>.</p>
+    <input type="password" id="token-input" autocomplete="off" spellcheck="false" aria-label="Access token">
+    <div class="dialog-actions">
+      <button class="ghost" type="button" id="token-cancel">Cancel</button>
+      <button class="send" type="submit" id="token-save" value="save">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<noscript>
+  <p class="noscript">This page needs JavaScript to talk to the termchat bridge.</p>
+</noscript>
+
+<script src="/markdown.js" defer></script>
+<script src="/app.js" defer></script>
+</body>
+</html>

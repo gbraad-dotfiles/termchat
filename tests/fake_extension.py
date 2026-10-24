@@ -8,6 +8,7 @@ a canned answer and finishes. No browser or DOM involved.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sys
@@ -30,7 +31,12 @@ def call(port: int, path: str, method: str = "GET", body: dict | None = None, ti
     if TOKEN:
         request.add_header("X-Termchat-Token", TOKEN)
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        raw = response.read()
+        try:
+            raw = response.read()
+        except http.client.IncompleteRead as exc:
+            # The CLI may exit as soon as it has the answer, closing the
+            # ephemeral bridge while a fire-and-forget reply is being read.
+            raw = exc.partial
         return response.status, (json.loads(raw) if raw else None)
 
 
@@ -62,6 +68,12 @@ def main() -> int:
     parser.add_argument("--error", metavar="MESSAGE")
     parser.add_argument("--timeout", type=float, default=15.0)
     parser.add_argument("--jobs", type=int, default=1, help="jobs to handle before exiting")
+    parser.add_argument(
+        "--idle-before",
+        type=float,
+        default=0.0,
+        help="seconds to stay away after the bridge answers a ping",
+    )
     parser.add_argument("--token", default="")
     args = parser.parse_args()
 
@@ -72,6 +84,9 @@ def main() -> int:
     if port is None:
         print("fake extension: no bridge found", file=sys.stderr)
         return 1
+
+    if args.idle_before > 0:
+        time.sleep(args.idle_before)
 
     deadline = time.monotonic() + args.timeout
     handled = 0

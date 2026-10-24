@@ -14,7 +14,7 @@
 
 const api = globalThis.browser ?? globalThis.chrome;
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.5';
 
 const DEFAULT_SETTINGS = {
   host: '127.0.0.1',
@@ -81,24 +81,45 @@ const SITE_MATCHES = [
 
 async function injectIntoOpenTabs() {
   if (!api.scripting || !api.tabs || !api.tabs.query) return;
+  let tabs;
   try {
-    const tabs = await api.tabs.query({ url: SITE_MATCHES });
-    await Promise.all(
-      tabs.map(async (tab) => {
-        if (tab.id == null) return;
-        try {
-          await api.scripting.executeScript({
-            target: { tabId: tab.id },
-            files: ['content.js'],
-          });
-        } catch {
-          /* discarded tab or navigation in progress */
-        }
-      })
-    );
+    tabs = await api.tabs.query({ url: SITE_MATCHES });
   } catch {
-    /* no access; the declared content scripts still run on page load */
+    return;
   }
+  await Promise.all(
+    tabs.map(async (tab) => {
+      if (tab.id == null) return;
+      if (api.tabs.update) {
+        // Keep the background chat tab from being discarded; a discarded tab
+        // has no content script and cannot be reached by the alarm.
+        try {
+          const result = api.tabs.update(tab.id, { autoDiscardable: false });
+          if (result && result.catch) result.catch(() => {});
+        } catch {
+          /* older browsers do not support this property */
+        }
+      }
+      if (tab.discarded) {
+        // Reloading a discarded tab has no live state to lose and restores the
+        // declared content script.
+        try {
+          await api.tabs.reload(tab.id);
+        } catch {
+          /* tab went away */
+        }
+        return;
+      }
+      try {
+        await api.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['content.js'],
+        });
+      } catch {
+        /* navigation in progress */
+      }
+    })
+  );
 }
 
 settingsReady.then(injectIntoOpenTabs);
@@ -107,6 +128,86 @@ if (api.runtime && api.runtime.onInstalled) {
     settingsReady.then(injectIntoOpenTabs);
   });
 }
+
+/* Browsers stop an idle service worker after about 30 seconds. The worker's
+ * polling loop then dies silently, so a command reaches the bridge but no tab
+ * asks for it until the user next touches the browser. A periodic alarm wakes
+ * the worker and nudges the content scripts to reconnect, even when tab timers
+ * are throttled. */
+const POLL_ALARM = 'termchat-keepalive';
+
+function ensureAlarm() {
+  if (!api.alarms || !api.alarms.create) return;
+  const create = (minutes) => {
+    try {
+      const result = api.alarms.create(POLL_ALARM, { periodInMinutes: minutes });
+      // Firefox returns a promise and older Chrome builds reject a period
+      // below one minute; fall back instead of leaving no alarm at all.
+      if (result && typeof result.catch === 'function') {
+        result.catch(() => {
+          if (minutes !== 1) create(1);
+        });
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const createAlarm = () => {
+    if (!create(0.5)) create(1);
+  };
+  // Creating an alarm with an existing name restarts its countdown. A worker
+  // that restarts because of a port message must not keep pushing the alarm
+  // into the future, so only create it when it is missing.
+  if (api.alarms.get) {
+    try {
+      const existing = api.alarms.get(POLL_ALARM);
+      if (existing && typeof existing.then === 'function') {
+        existing
+          .then((alarm) => {
+            if (!alarm) createAlarm();
+          })
+          .catch(createAlarm);
+        return;
+      }
+    } catch {
+      /* fall through and create it */
+    }
+  }
+  createAlarm();
+}
+
+async function wakeChatTabs() {
+  // The worker may have been restarted with no live ports. Putting the content
+  // script back into the tabs is what lets the wake message reach them.
+  if (!entries.size) await injectIntoOpenTabs();
+  startPolling();
+  if (!api.tabs || !api.tabs.query || !api.tabs.sendMessage) return;
+  let tabs;
+  try {
+    tabs = await api.tabs.query({ url: SITE_MATCHES });
+  } catch {
+    return;
+  }
+  await Promise.all(
+    tabs.map((tab) => {
+      if (tab.id == null) return null;
+      return Promise.resolve(
+        api.tabs.sendMessage(tab.id, { type: 'termchat-wake' })
+      ).catch(() => {});
+    })
+  );
+}
+
+if (api.alarms && api.alarms.onAlarm) {
+  api.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === POLL_ALARM) wakeChatTabs();
+  });
+}
+if (api.runtime && api.runtime.onStartup) {
+  api.runtime.onStartup.addListener(ensureAlarm);
+}
+ensureAlarm();
 
 function bridgeUrl(port, path) {
   const host =
@@ -247,6 +348,14 @@ async function postDone(port, job, text, error, meta, markdown = '') {
   }
 }
 
+/* Diagnostics from the worker and the page end up in the bridge's log and in
+ * `termchat <site> --check -v`. They are fire-and-forget: a diagnostic must
+ * never delay or break the job. */
+function pageLog(port, job, message) {
+  request(`/v1/job/${job.id}/log`, 'POST', { level: 'info', message: String(message) }, port)
+    .catch(() => {});
+}
+
 /* ------------------------------------------------------------------ */
 /* tab registry                                                        */
 /* ------------------------------------------------------------------ */
@@ -256,6 +365,31 @@ const active = new Set(); // sites currently running a job
 const waiters = new Map(); // site -> Set(resolve)
 let commandSeq = 0;
 let pollRunning = false;
+let aliveAt = 0;
+
+/* An in-flight fetch does not reset the service worker's 30 second idle timer.
+ * While there are tabs to poll, make a cheap extension API call often enough
+ * that the worker stays alive even when the page is hidden and its timers are
+ * throttled. The alarm remains the fallback for a worker that was already
+ * stopped. */
+function keepWorkerAlive() {
+  const now = Date.now();
+  if (now - aliveAt < 20000) return;
+  aliveAt = now;
+  try {
+    if (api.runtime && api.runtime.getPlatformInfo) {
+      const result = api.runtime.getPlatformInfo();
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+      return;
+    }
+    if (api.storage && api.storage.local) {
+      const result = api.storage.local.get('termchat-keepalive');
+      if (result && typeof result.catch === 'function') result.catch(() => {});
+    }
+  } catch {
+    /* the worker is shutting down */
+  }
+}
 
 function siteForUrl(url) {
   try {
@@ -291,6 +425,16 @@ function register(entry) {
   }
   entry.connectedAt = Date.now();
   tabs.set(entry.tabId, entry);
+  if (previous !== entry && api.tabs && api.tabs.update) {
+    // Do not let the browser discard the chat tab while it is in the
+    // background; a discarded tab cannot be woken by an alarm.
+    try {
+      const result = api.tabs.update(entry.tabId, { autoDiscardable: false });
+      if (result && result.catch) result.catch(() => {});
+    } catch {
+      /* older browsers do not support this property */
+    }
+  }
 }
 
 function unregister(entry) {
@@ -366,11 +510,26 @@ api.runtime.onConnect.addListener((port) => {
     return;
   }
 
-  const entry = { port, tabId: tab.id, site, pending: new Map(), connectedAt: 0 };
+  const entry = {
+    port,
+    tabId: tab.id,
+    site,
+    pending: new Map(),
+    connectedAt: 0,
+    version: '',
+  };
 
   port.onMessage.addListener((msg) => {
     if (!msg) return;
     if (msg.type === 'hello') {
+      // A tab can still run the content script from before the extension was
+      // reloaded. Never route jobs through it; the content script injected by
+      // the worker connects with the matching build and takes over. Leave the
+      // stale port open: disconnecting it makes an older build reconnect in a
+      // loop.
+      const version = String(msg.version || '');
+      if (version !== VERSION) return;
+      entry.version = version;
       register(entry);
       wake(site);
       startPolling();
@@ -405,6 +564,7 @@ function startPolling() {
   (async () => {
     try {
       while (entries.size) {
+        keepWorkerAlive();
         await Promise.all([...entries.keys()].map(pollSite));
         await sleep(100);
       }
@@ -419,7 +579,9 @@ async function pollSite(site) {
   if (!entries.has(site) || active.has(site)) return;
   let reply;
   try {
-    reply = await request(`/v1/job?site=${encodeURIComponent(site)}&wait=2`);
+    reply = await request(
+      `/v1/job?site=${encodeURIComponent(site)}&wait=2&version=${encodeURIComponent(VERSION)}`
+    );
   } catch {
     await sleep(500);
     return;
@@ -485,6 +647,117 @@ async function resetTab(site) {
 /* one job                                                             */
 /* ------------------------------------------------------------------ */
 
+// Gemini (and the other sites) do not reliably submit or repaint from a
+// hidden tab: a synthetic click can be ignored and the answer text can lag
+// until the page is visible again. While a job runs, select its chat tab and
+// bring its window forward. The tab that was selected before, and the window
+// that had focus, are restored at the end. (A tab in an unpainted background
+// window is still hidden to the page even when it is the active tab there,
+// which is why focusing only the tab is not enough.)
+//
+// Jobs for different sites can run at once in the same window, so track how
+// many jobs have foregrounded a tab there; only the last one restores it.
+const foreground = new Map();
+
+async function showChatTab(entry) {
+  if (!api.tabs || !api.tabs.get || entry.tabId == null) {
+    return { skipped: 'no tabs api' };
+  }
+  try {
+    const tab = await api.tabs.get(entry.tabId);
+    if (!tab) return { skipped: 'tab not found' };
+    let win = null;
+    if (api.windows && api.windows.get) {
+      try {
+        win = await api.windows.get(tab.windowId);
+      } catch {
+        /* window may be gone */
+      }
+    }
+    const details = {
+      tab: tab.id,
+      window: tab.windowId,
+      active: Boolean(tab.active),
+      focused: Boolean(win && win.focused),
+      state: win ? win.state : '',
+      previous: null,
+      raised: false,
+    };
+    if (details.active && details.focused && (!win || win.state !== 'minimized')) {
+      return details; // already visible; nothing to select or restore
+    }
+
+    let state = foreground.get(tab.windowId);
+    if (!state) {
+      try {
+        const shown = await api.tabs.query({ active: true, windowId: tab.windowId });
+        if (shown && shown.length && shown[0].id !== tab.id) {
+          details.previous = shown[0].id;
+        }
+      } catch {
+        /* query is optional; without it the previous tab is not restored */
+      }
+      state = { previous: details.previous, depth: 0, tabs: new Set() };
+      foreground.set(tab.windowId, state);
+    }
+    if (!tab.active) {
+      try {
+        await api.tabs.update(tab.id, { active: true });
+      } catch (err) {
+        details.error = String((err && err.message) || err);
+      }
+    }
+    if (win && (!win.focused || win.state === 'minimized') && api.windows && api.windows.update) {
+      const props = { focused: true };
+      if (win.state === 'minimized') props.state = 'normal';
+      try {
+        await api.windows.update(tab.windowId, props);
+        details.raised = true;
+      } catch (err) {
+        details.error = String((err && err.message) || err);
+      }
+    }
+    state.depth += 1;
+    state.tabs.add(tab.id);
+    return details;
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+}
+
+async function restoreChatTab(saved) {
+  if (!saved || saved.skipped || saved.window == null) return '';
+  const state = foreground.get(saved.window);
+  if (!state) return '';
+  state.depth -= 1;
+  if (state.depth > 0) return 'deferred';
+  foreground.delete(saved.window);
+  let what = '';
+  try {
+    if (state.previous != null) {
+      const current = await api.tabs.query({ active: true, windowId: saved.window });
+      // Only restore when the active tab is one we selected; if the user has
+      // chosen another tab in the meantime, leave their choice alone.
+      if (current && current.length && state.tabs.has(current[0].id)) {
+        await api.tabs.update(state.previous, { active: true });
+        what = `tab=${state.previous}`;
+      }
+    }
+  } catch {
+    /* the window or tab may be gone */
+  }
+  if (saved.raised && api.windows && api.windows.update) {
+    try {
+      // Brings the next window in the z-order forward, normally the terminal.
+      await api.windows.update(saved.window, { focused: false });
+      what += (what ? ' ' : '') + 'unfocused';
+    } catch {
+      /* the window may be gone */
+    }
+  }
+  return what;
+}
+
 function tidy(text) {
   return String(text || '')
     .replace(/\u00a0/g, ' ')
@@ -507,6 +780,18 @@ async function runJob(site, job, port, firstEntry) {
   let lastText = '';
   let lastMarkdown = '';
 
+  const shown = await showChatTab(firstEntry);
+  pageLog(
+    port,
+    job,
+    shown.error
+      ? `start tab=${firstEntry.tabId} error=${shown.error}`
+      : shown.skipped
+        ? `start tab=${firstEntry.tabId} skipped=${shown.skipped}`
+        : `start tab=${shown.tab} active=${shown.active} focused=${shown.focused} ` +
+          `state=${shown.state || '?'} previous=${shown.previous ?? '-'} raised=${shown.raised}`
+  );
+
   try {
     if (job.inspect) {
       const res = await sendCommand(firstEntry, { cmd: 'inspect' }, 8000);
@@ -524,8 +809,12 @@ async function runJob(site, job, port, firstEntry) {
     let sawNew = false;
     let lastSent = '';
     let lastSentAt = 0;
+    let sawNewLogged = false;
+    const env = (res) =>
+      `vis=${res.vis || '?'} focus=${res.focus} size=${res.w ?? '?'}x${res.h ?? '?'}`;
 
     while (Date.now() < deadline) {
+      keepWorkerAlive();
       const entry = pickEntry(site);
       if (!entry) {
         if (phase === 'stream') {
@@ -544,7 +833,8 @@ async function runJob(site, job, port, firstEntry) {
             { cmd: 'prepare', job_id: jobId, prompt, new_chat: newChatWanted },
             12000
           );
-        } catch {
+        } catch (err) {
+          pageLog(port, job, `prepare did not answer: ${String((err && err.message) || err)}`);
           await waitForEntry(site, 15000);
           continue;
         }
@@ -552,6 +842,7 @@ async function runJob(site, job, port, firstEntry) {
         if (res.newchat) newChatWanted = false;
         if (res.ready) {
           pre = res.pre || { count: 0, last: '' };
+          pageLog(port, job, `prepare ready ${env(res)}`);
           phase = 'submit';
           continue;
         }
@@ -563,12 +854,14 @@ async function runJob(site, job, port, firstEntry) {
         let res;
         try {
           res = await sendCommand(entry, { cmd: 'submit', job_id: jobId }, 15000);
-        } catch {
+        } catch (err) {
+          pageLog(port, job, `submit did not answer: ${String((err && err.message) || err)}`);
           await waitForEntry(site, 15000);
           continue;
         }
         if (res.error) throw new Error(res.error);
         if (res.submitted) {
+          pageLog(port, job, `submit how=${res.how || '?'} ${env(res)}`);
           phase = 'stream';
           submitAt = Date.now();
           stableAt = Date.now();
@@ -583,7 +876,8 @@ async function runJob(site, job, port, firstEntry) {
       let res;
       try {
         res = await sendCommand(entry, { cmd: 'status', job_id: jobId }, 8000);
-      } catch {
+      } catch (err) {
+        pageLog(port, job, `status did not answer: ${String((err && err.message) || err)}`);
         await waitForEntry(site, 15000);
         continue;
       }
@@ -596,6 +890,10 @@ async function runJob(site, job, port, firstEntry) {
       const isNewAnswer = text !== pre.last || Number(res.count) > Number(pre.count || 0);
       if (text && isNewAnswer) {
         sawNew = true;
+        if (!sawNewLogged) {
+          sawNewLogged = true;
+          pageLog(port, job, `answer started ${env(res)} stop=${Boolean(res.stop)}`);
+        }
         lastMarkdown = String(res.markdown || '');
         if (text !== lastText) {
           lastText = text;
@@ -689,5 +987,8 @@ async function runJob(site, job, port, firstEntry) {
       meta,
       lastMarkdown
     );
+  } finally {
+    const restored = await restoreChatTab(shown);
+    pageLog(port, job, `restored ${restored || 'nothing'}`);
   }
 }

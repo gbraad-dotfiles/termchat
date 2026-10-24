@@ -10,6 +10,7 @@ back. You stay signed in in your normal browser profile.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hmac
 import ipaddress
 import json
@@ -36,12 +37,67 @@ SITE_ORIGINS = {
     "deepseek": "https://chat.deepseek.com",
 }
 ALLOWED_ORIGINS = frozenset(SITE_ORIGINS.values())
+WEB_ROOT = Path(__file__).resolve().parent.parent / "web"
+WEB_FILES = {
+    "/": ("index.html", "text/html; charset=utf-8"),
+    "/index.html": ("index.html", "text/html; charset=utf-8"),
+    "/style.css": ("style.css", "text/css; charset=utf-8"),
+    "/markdown.js": ("markdown.js", "text/javascript; charset=utf-8"),
+    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+}
 DEFAULT_BASE_PORT = 8765
 DEFAULT_PORT_SPAN = 10
 DEFAULT_TIMEOUT = 300.0
 DEFAULT_CONNECT_WAIT = 30.0
 MAX_BODY = 16 * 1024 * 1024
 LARGE_PROMPT = 100_000
+
+
+class Activity:
+    """A one-line progress indicator on stderr, for interactive terminals only.
+
+    Piped or redirected stderr stays byte-for-byte quiet. The line is redrawn
+    in place and erased before any other output.
+    """
+
+    FRAMES = "|/-\\"
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.color = False
+        self.shown = ""
+        self.drawn_at = 0.0
+        self.active = False
+
+    def update(self, text: str, elapsed: float = 0.0) -> None:
+        if not self.enabled:
+            return
+        now = time.monotonic()
+        frame = self.FRAMES[int(now * 4) % len(self.FRAMES)]
+        suffix = f" ({elapsed:.0f}s)" if elapsed >= 1 else ""
+        line = f"{frame} termchat: {text}{suffix}"
+        if line == self.shown and now - self.drawn_at < 0.2:
+            return
+        self.shown = line
+        self.drawn_at = now
+        self.active = True
+        rendered = f"\x1b[2m{line}\x1b[0m" if self.color else line
+        sys.stderr.write("\r\x1b[K" + rendered)
+        sys.stderr.flush()
+
+    def clear(self) -> None:
+        if not self.active:
+            return
+        self.active = False
+        self.shown = ""
+        if not self.enabled:
+            return
+        sys.stderr.write("\r\x1b[K")
+        sys.stderr.flush()
+
+
+ACTIVITY = Activity()
+atexit.register(ACTIVITY.clear)
 
 
 # --------------------------------------------------------------------------
@@ -90,6 +146,18 @@ class Bridge:
         self.pings = 0
         self.last_ping = 0.0
         self.polls: set[str] = set()
+        self.polled_at: dict[str, float] = {}
+        self.extension_version = ""
+        self.page_log: list[tuple[float, str, str]] = []
+
+    def note(self, job_id: str, message: str) -> None:
+        """Record a page diagnostic; visible on the server log and in --check -v."""
+        with self.cond:
+            self.page_log.append((time.monotonic(), job_id, message))
+            del self.page_log[:-40]
+            if self.verbose or self.mode == "server":
+                sys.stderr.write(f"[page {job_id[:8]}] {message}\n")
+                sys.stderr.flush()
 
     def submit(self, job: Job) -> None:
         with self.cond:
@@ -98,6 +166,12 @@ class Bridge:
             self.pending.append(job)
             self._prune()
             self.cond.notify_all()
+            if self.verbose or self.mode == "server":
+                sys.stderr.write(
+                    f"[job {job.id[:8]}] queued site={job.site} "
+                    f"chars={len(job.prompt)} new_chat={job.new_chat}\n"
+                )
+                sys.stderr.flush()
 
     def _prune(self) -> None:
         """Drop abandoned and old finished jobs. Caller holds the condition."""
@@ -138,6 +212,11 @@ class Bridge:
                         job.seq += 1
                         self.active[job.id] = job
                         self.cond.notify_all()
+                        if self.verbose or self.mode == "server":
+                            sys.stderr.write(
+                                f"[job {job.id[:8]}] picked up by {site} tab\n"
+                            )
+                            sys.stderr.flush()
                         return job
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -172,6 +251,12 @@ class Bridge:
             if state == "done":
                 job.finished_at = time.monotonic()
                 self.active.pop(job_id, None)
+                if self.verbose or self.mode == "server":
+                    sys.stderr.write(
+                        f"[job {job_id[:8]}] done error={job.error or '-'} "
+                        f"chars={len(job.text or '')}\n"
+                    )
+                    sys.stderr.flush()
             self.cond.notify_all()
             return True
 
@@ -238,10 +323,19 @@ class Bridge:
 # --------------------------------------------------------------------------
 
 
-def origin_allowed(origin: str) -> bool:
+def origin_allowed(origin: str, host: str = "") -> bool:
     if origin in ALLOWED_ORIGINS:
         return True
-    return origin.startswith(("chrome-extension://", "moz-extension://"))
+    if origin.startswith(("chrome-extension://", "moz-extension://")):
+        return True
+    # The web UI is served by this same bridge, often from another machine.
+    # A browser sends Origin on its POSTs, so accept the page only when its
+    # origin is this exact host:port. Foreign origins stay blocked.
+    if host:
+        parsed = urlparse(origin)
+        if parsed.scheme in ("http", "https") and parsed.netloc.lower() == host.lower():
+            return True
+    return False
 
 
 def is_loopback_address(bind: str) -> bool:
@@ -283,10 +377,32 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _origin(self) -> str | None:
         """Return the allowed Origin ('' when absent), or None after a 403."""
         origin = self.headers.get("Origin") or ""
-        if origin and not origin_allowed(origin):
+        if origin and not origin_allowed(origin, self.headers.get("Host") or ""):
             self._send(403, {"error": "origin not allowed"})
             return None
         return origin
+
+    def _serve_web(self, path: str) -> None:
+        name, content_type = WEB_FILES[path]
+        try:
+            body = (WEB_ROOT / name).read_bytes()
+        except OSError:
+            body = (
+                "<!doctype html><meta charset=\"utf-8\"><title>termchat</title>"
+                "<p>The termchat web UI is missing. Expected web/index.html "
+                "next to bin/termchat.</p>"
+            ).encode("utf-8")
+            content_type = "text/html; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _authorized(self, origin: str = "") -> bool:
         """When a token is configured, require it on job traffic."""
@@ -317,7 +433,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:  # noqa: N802 (http.server API)
         origin = self.headers.get("Origin") or ""
-        if origin and not origin_allowed(origin):
+        if origin and not origin_allowed(origin, self.headers.get("Host") or ""):
             self._send(403, {"error": "origin not allowed"})
             return
         self.send_response(204)
@@ -335,6 +451,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if origin is None:
             return
         url = urlparse(self.path)
+        if url.path in WEB_FILES:
+            self._serve_web(url.path)
+            return
         if url.path == "/v1/ping":
             query = parse_qs(url.query)
             probe = (query.get("probe") or [""])[0]
@@ -343,20 +462,36 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self.bridge.pings += 1
                     self.bridge.last_ping = time.monotonic()
                     self.bridge.cond.notify_all()
+                now = time.monotonic()
                 age = (
                     None
                     if not self.bridge.last_ping
-                    else round(time.monotonic() - self.bridge.last_ping, 1)
+                    else round(now - self.bridge.last_ping, 1)
                 )
+                poll_ages = {
+                    poll_site: round(now - seen, 1)
+                    for poll_site, seen in self.bridge.polled_at.items()
+                }
+                recent_logs = [
+                    {
+                        "job": job_id[:8],
+                        "age": round(now - seen, 1),
+                        "message": message,
+                    }
+                    for seen, job_id, message in self.bridge.page_log[-10:]
+                ]
                 payload = {
                     "app": APP,
                     "version": VERSION,
                     "sites": list(SITES),
                     "mode": self.bridge.mode,
                     "polls": sorted(self.bridge.polls),
+                    "poll_ages": poll_ages,
                     "pending": len(self.bridge.pending),
                     "active": len(self.bridge.active),
                     "last_ping_age": age,
+                    "extension_version": self.bridge.extension_version,
+                    "recent_logs": recent_logs,
                 }
             self._send(200, payload, origin)
             return
@@ -385,8 +520,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if site not in SITES:
                 self._send(400, {"error": "unknown site"}, origin)
                 return
+            version = (query.get("version") or [""])[0][:40]
             with self.bridge.cond:
                 self.bridge.polls.add(site)
+                self.bridge.polled_at[site] = time.monotonic()
+                if version:
+                    self.bridge.extension_version = version
                 self.bridge.cond.notify_all()
             try:
                 wait = float((query.get("wait") or ["2"])[0])
@@ -464,10 +603,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "invalid JSON body"}, origin)
                 return
             if action == "log":
-                if self.bridge.verbose:
-                    sys.stderr.write(
-                        f"[page] {payload.get('level', 'info')}: {payload.get('message', '')}\n"
-                    )
+                self.bridge.note(
+                    job_id,
+                    f"{payload.get('level', 'info')}: {payload.get('message', '')}",
+                )
                 self._send(200, {"ok": True}, origin)
                 return
             if action == "progress":
@@ -622,6 +761,7 @@ def check_remote(remote: RemoteClient, site: str, wait: float, verbose: bool = F
     deadline = time.monotonic() + max(0.0, wait)
     last_error = ""
     last_age: float | None = None
+    stale_warned = False
     while True:
         try:
             info = remote.ping()
@@ -630,23 +770,68 @@ def check_remote(remote: RemoteClient, site: str, wait: float, verbose: bool = F
             info = None
         if info:
             polls = info.get("polls") or []
+            raw_ages = info.get("poll_ages")
+            ages: dict[str, float] = {}
+            if isinstance(raw_ages, dict):
+                ages = {
+                    str(key): float(value)
+                    for key, value in raw_ages.items()
+                    if isinstance(value, (int, float))
+                }
+                fresh = {key for key, value in ages.items() if value <= 10.0}
+            else:
+                # An older server does not report poll ages; fall back to its
+                # site list rather than reporting a false failure.
+                fresh = set(polls)
+            version = str(info.get("extension_version") or "")
             age = info.get("last_ping_age")
             if isinstance(age, (int, float)):
                 last_age = float(age)
             if verbose:
+                shown_ages = (
+                    ", ".join(f"{key}={value:g}s" for key, value in sorted(ages.items()))
+                    or "-"
+                )
                 print(
                     f"termchat: server {remote.url}: pending={info.get('pending', 0)} "
                     f"active={info.get('active', 0)} polls={','.join(polls) or '-'} "
+                    f"poll_ages={shown_ages} "
+                    f"extension={version or '-'} "
                     f"last_ping={'-' if age is None else f'{age}s ago'}",
                     file=sys.stderr,
                 )
-            if site in polls:
+                for entry in info.get("recent_logs") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    print(
+                        f"termchat: page {entry.get('job', '?')} "
+                        f"{entry.get('age', '?')}s ago: {entry.get('message', '')}",
+                        file=sys.stderr,
+                    )
+            if site in fresh:
+                label = f" (extension {version})" if version else ""
                 print(
                     f"termchat: the extension is polling for {site}. "
-                    "The server is reachable.",
+                    f"The server is reachable{label}.",
                     file=sys.stderr,
                 )
                 return 0
+            if fresh:
+                label = f" (extension {version})" if version else ""
+                print(
+                    "termchat: the extension is polling for "
+                    f"{', '.join(sorted(fresh))}, but no tab for {site} is "
+                    f"connected{label}.",
+                    file=sys.stderr,
+                )
+                return 1
+            if ages and not stale_warned:
+                stale_warned = True
+                print(
+                    f"termchat: the extension last polled {min(ages.values()):.0f}s "
+                    "ago; its worker is not running now.",
+                    file=sys.stderr,
+                )
             last_error = ""
         if time.monotonic() >= deadline:
             break
@@ -658,6 +843,12 @@ def check_remote(remote: RemoteClient, site: str, wait: float, verbose: bool = F
             "termchat: is 'termchat serve' running and reachable from this machine?",
             file=sys.stderr,
         )
+    elif stale_warned:
+        print(
+            "termchat: no recent job poll. The extension reached the server, but "
+            "its worker is not running now.",
+            file=sys.stderr,
+        )
     elif last_age is not None and last_age < 15:
         print(
             f"termchat: the extension is reaching the server, but no chat tab is "
@@ -667,7 +858,7 @@ def check_remote(remote: RemoteClient, site: str, wait: float, verbose: bool = F
     else:
         print(
             "termchat: nothing reached the server recently. If the browser runs on "
-            "another machine, set the extension Options Host to this machine (not "
+            "another machine, set the extension Options host to this machine (not "
             "127.0.0.1), allow the permission, then reload the chat tab.",
             file=sys.stderr,
         )
@@ -971,20 +1162,48 @@ def save_diagnostics(job: Job) -> Path | None:
 
 def wait_for_extension(bridge: Bridge, job: Job, timeout: float, site: str) -> bool:
     start = time.monotonic()
+    # A worker that was suspended after a poll leaves a recent ping behind. Its
+    # keepalive alarm or the tab heartbeat will wake it, so give it one longer
+    # window instead of reporting "no browser tab" while it is asleep.
+    late = min(max(timeout, 1.0) * 3.0, 90.0)
+    extended = False
     warned = False
     while True:
+        now = time.monotonic()
         with bridge.cond:
             if job.assigned:
+                ACTIVITY.clear()
                 return True
-        elapsed = time.monotonic() - start
-        if elapsed >= timeout:
+            asleep = (
+                not extended
+                and late > timeout
+                and bridge.pings > 0
+                and now - bridge.last_ping <= 60.0
+            )
+        if now - start >= (late if extended else timeout):
+            if asleep:
+                extended = True
+                if bridge.verbose:
+                    ACTIVITY.clear()
+                    print(
+                        "termchat: the extension is asleep; waiting for it to wake",
+                        file=sys.stderr,
+                    )
+                ACTIVITY.update(
+                    f"{site}: extension asleep, waiting for it to wake",
+                    now - start,
+                )
+                continue
+            ACTIVITY.clear()
             return False
-        if bridge.verbose and not warned and elapsed > 2.0:
+        if bridge.verbose and not warned and now - start > 2.0:
+            ACTIVITY.clear()
             print(
                 f"termchat: waiting for the browser extension for {site}",
                 file=sys.stderr,
             )
             warned = True
+        ACTIVITY.update(f"{site}: waiting for the browser tab", now - start)
         time.sleep(0.1)
 
 
@@ -997,17 +1216,41 @@ def check_bridge(bridge: Bridge, bind: str, port: int, wait: float, site: str) -
     )
     deadline = time.monotonic() + wait
     saw_ping = False
+    stale_warned = False
     while True:
+        now = time.monotonic()
         with bridge.cond:
             polls = set(bridge.polls)
+            poll_ages = {key: now - seen for key, seen in bridge.polled_at.items()}
+            version = bridge.extension_version
             pings = bridge.pings
-        if polls:
+        # A poll older than this means the worker was stopped; the set of sites
+        # alone would keep claiming success long after the tab went quiet.
+        fresh = {key for key in polls if poll_ages.get(key, 1e9) <= 10.0}
+        if fresh:
+            label = f" (extension {version})" if version else ""
+            if site in fresh:
+                print(
+                    "termchat: the extension is polling for "
+                    f"{', '.join(sorted(fresh))}. The bridge is reachable{label}.",
+                    file=sys.stderr,
+                )
+                return 0
             print(
                 "termchat: the extension is polling for "
-                f"{', '.join(sorted(polls))}. The bridge is reachable.",
+                f"{', '.join(sorted(fresh))}, but no tab for "
+                f"{SITE_ORIGINS.get(site, site)} is connected{label}.",
                 file=sys.stderr,
             )
-            return 0
+            return 1
+        if polls and not stale_warned:
+            stale_warned = True
+            age = min(poll_ages.values()) if poll_ages else 0.0
+            print(
+                f"termchat: the extension last polled {age:.0f}s ago; its worker "
+                "is not running now. Waiting for an alarm or a tab heartbeat.",
+                file=sys.stderr,
+            )
         if pings and not saw_ping:
             saw_ping = True
             print(
@@ -1020,6 +1263,13 @@ def check_bridge(bridge: Bridge, bind: str, port: int, wait: float, site: str) -
         with bridge.cond:
             bridge.cond.wait(0.25)
 
+    if stale_warned:
+        print(
+            "termchat: no recent job poll. The extension reached the bridge, but "
+            "its worker is not running now.",
+            file=sys.stderr,
+        )
+        return 1
     if saw_ping:
         print(
             "termchat: the extension reached the bridge but never asked for a job. "
@@ -1059,6 +1309,8 @@ def run_job(
         return 3
 
     deadline = time.monotonic() + timeout + 30
+    answer_start = time.monotonic()
+    show_activity = True
     printed = ""
     state = job.state
     text = job.text
@@ -1076,9 +1328,20 @@ def run_job(
             error = f"timed out after {timeout:g}s waiting for the page"
             break
         if stream and text != printed:
+            ACTIVITY.clear()
             printed = print_delta(text, printed, stream)
+            show_activity = False
+        elif show_activity:
+            label = (
+                f"{job.site}: answering"
+                if text
+                else f"{job.site}: waiting for the page to answer"
+            )
+            ACTIVITY.update(label, time.monotonic() - answer_start)
         with bridge.cond:
             bridge.cond.wait(0.2)
+
+    ACTIVITY.clear()
 
     if job.inspect:
         print(json.dumps(meta or {}, indent=2, ensure_ascii=False))
@@ -1137,12 +1400,19 @@ def run_remote(
         print(f"termchat: {exc}", file=sys.stderr)
         return 3
 
+    ACTIVITY.update(f"{job.site}: sent to {remote.url}")
+
     start = time.monotonic()
     deadline = start + timeout + 30
     idle_since = start
+    # See wait_for_extension: a suspended worker still has a recent ping.
+    late = min(max(wait, 1.0) * 3.0, 90.0)
+    extended = False
     after = -1
     printed = ""
     picked = False
+    picked_at = 0.0
+    show_activity = True
     state = "pending"
     text = ""
     markdown: str | None = None
@@ -1154,6 +1424,7 @@ def run_remote(
             try:
                 snap = remote.state(job_id, after, 2.0)
             except RemoteError as exc:
+                ACTIVITY.clear()
                 if "unknown job" in str(exc):
                     print(
                         "termchat: the server no longer has this job "
@@ -1171,6 +1442,8 @@ def run_remote(
             error = snap.get("error") or None
             meta = snap.get("meta") or None
             if state in ("running", "done"):
+                if not picked:
+                    picked_at = time.monotonic()
                 picked = True
 
             queued = int(snap.get("queued_ahead") or 0)
@@ -1179,8 +1452,21 @@ def run_remote(
                 # should not start until our turn.
                 idle_since = time.monotonic()
 
-            if not picked and time.monotonic() - idle_since > wait:
-                if queued == 0:
+            if not picked and queued == 0:
+                idle = time.monotonic() - idle_since
+                if idle > (late if extended else wait):
+                    if not extended and late > wait:
+                        awake = False
+                        try:
+                            info = remote.ping() or {}
+                            age = info.get("last_ping_age")
+                            awake = isinstance(age, (int, float)) and age <= 60.0
+                        except RemoteError:
+                            pass
+                        if awake:
+                            extended = True
+                            continue
+                    ACTIVITY.clear()
                     remote.cancel(job_id)
                     print(
                         f"termchat: no browser tab picked up the job (server {remote.url}).",
@@ -1194,16 +1480,32 @@ def run_remote(
                     return 3
 
             if stream and text != printed:
+                ACTIVITY.clear()
                 printed = print_delta(text, printed, stream)
+                show_activity = False
+            elif show_activity:
+                if picked:
+                    ACTIVITY.update(
+                        f"{job.site}: answering", time.monotonic() - picked_at
+                    )
+                else:
+                    ACTIVITY.update(
+                        f"{job.site}: sent to {remote.url}, "
+                        "waiting for the browser tab",
+                        time.monotonic() - idle_since,
+                    )
             if state == "done":
                 break
             if time.monotonic() > deadline:
+                ACTIVITY.clear()
                 remote.cancel(job_id)
                 error = f"timed out after {timeout:g}s waiting for the page"
                 break
     except KeyboardInterrupt:
         remote.cancel(job_id)
         raise
+    finally:
+        ACTIVITY.clear()
 
     if snap.get("inspect"):
         print(json.dumps(meta or {}, indent=2, ensure_ascii=False))
@@ -1454,6 +1756,9 @@ def serve_main(argv: list[str]) -> int:
         return 1
     server.daemon_threads = True
     print(f"termchat: server listening on http://{bind}:{port}", file=sys.stderr)
+    if (WEB_ROOT / "index.html").is_file():
+        web_host = "127.0.0.1" if is_loopback_address(bind) else bind
+        print(f"termchat: web UI at http://{web_host}:{port}/", file=sys.stderr)
     if not is_loopback_address(bind) and not token:
         print(
             f"termchat: no token; anyone who can reach http://{bind}:{port} "
@@ -1683,6 +1988,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     color = styled and "NO_COLOR" not in os.environ
     stream = not args.json and not styled and sys.stdout.isatty()
+    # Progress feedback only when a person is looking at a terminal. Piped
+    # output remains quiet for scripts, tests and other commands.
+    ACTIVITY.enabled = sys.stderr.isatty() and not args.json
+    ACTIVITY.color = color
 
     if remote is not None:
         if args.check:

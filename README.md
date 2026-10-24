@@ -111,6 +111,11 @@ layout but drop the colours, or `--markdown` to force styling when stdout is
 not a terminal. When piped, the plain final text is printed, so
 `termchat … > answer.md` works as expected.
 
+When stderr is a terminal, one status line is drawn in place while a command
+waits, for example `termchat: sent to http://10.0.21.22:8765, waiting for the
+browser tab (4s)` and then `termchat: answering (12s)`. It is erased before the
+answer starts. Piped or redirected stderr, and `--json`, get no extra output.
+
 
 ### Options
 
@@ -122,7 +127,7 @@ not a terminal. When piped, the plain final text is printed, so
 | `-i, --interactive` | small REPL; `:new`, `:continue`, `:inspect`, `:quit` |
 | `--inspect` | dump composer/send/response candidates as JSON |
 | `--timeout SEC` | how long to wait for an answer (default 300) |
-| `--wait SEC` | how long to wait for the extension to pick the job up (default 30) |
+| `--wait SEC` | how long to wait for the extension to pick the job up (default 30; up to 3× when the extension recently polled and is only asleep) |
 | `--json` | print `{site, text, error, meta}` |
 | `--plain` | print the raw text and stream it (no Markdown styling) |
 | `--markdown` | render Markdown styling even when stdout is not a TTY |
@@ -178,11 +183,35 @@ Notes:
   it can otherwise submit prompts.
 
 
+## Web interface
+
+`termchat serve` also serves a small web page on the same port. Open
+`http://<server>:8765/` in any browser that can reach the server; it does not
+have to be the browser that runs the extension:
+
+- choose Gemini, Copilot or DeepSeek in the top bar;
+- type a prompt and press Enter (`Shift+Enter` adds a line);
+- the answer streams in and is rendered as Markdown; **Stop** cancels the job;
+- with **New chat** ticked the next prompt starts a fresh conversation,
+  otherwise it continues the thread shown in the page.
+
+Each site keeps its own transcript in the browser's `localStorage`, and an
+answer that was still running is picked up again after a reload. The page uses
+the same `/v1/request` and `/v1/state` endpoints as the CLI, so it shares the
+per-site queue with commands from the terminal and from other machines.
+
+When the server was started with `--token`, the page asks for the token and
+remembers it in `localStorage`. Use the **Token** button to replace or clear it
+on a shared browser. The page is served from the bridge's own origin; requests
+from any other origin are still rejected.
+
+
 ## How it works
 
 1. The CLI either submits to a running `termchat serve` (explicit `--server`,
    or auto-detected on the local base port) or starts its own bridge on the
-   first free port in `127.0.0.1:8765–8774` and queues the job.
+   first free port in `127.0.0.1:8765–8774` and queues the job. The web page
+   served by `serve` submits to the same `/v1/request` endpoint.
 2. The extension's background service worker discovers that port (it probes the
    range with `/v1/ping`) and long-polls `/v1/job` for open chat tabs.
 3. For each job the worker drives a small state machine through the content
@@ -194,10 +223,38 @@ Notes:
    throttle timers in hidden tabs (down to once per minute), which would make
    this unusable while you are in the terminal; message delivery is not
    throttled.
+5. Browsers stop an idle service worker after about 30 seconds. A `chrome.alarms`
+   heartbeat (30 s, or 60 s on browsers that reject shorter periods) wakes it
+   again, and the content scripts re-announce themselves, so a background chat
+   tab keeps answering commands. While the page is alive it also sends a light
+   port heartbeat every 20 seconds. A pending `fetch` does *not* count as
+   activity for the idle timer, so while polling or running a job the worker
+   also calls a cheap extension API (`runtime.getPlatformInfo`) every 20
+   seconds; without that, Vivaldi lets the worker fall asleep even while its
+   long-poll is in flight.
+6. Hidden tabs are protected from the browser's memory saver: the content
+   script holds a no-op Web Lock, which opts the tab out of freezing, and the
+   worker marks it `autoDiscardable: false`. A tab that was already discarded
+   is reloaded by the heartbeat. If the worker was asleep when a command
+   arrived, the CLI gives a recently-polling extension one longer window
+   (three times `--wait`, at most 90 s) instead of failing at the first
+   timeout. A tab running the content script from before an extension reload
+   is ignored; the worker injects the current build, which takes over.
+7. Even when it is not frozen, a hidden Gemini tab may ignore the synthetic
+   send click or stop repainting the answer. For the duration of a job the
+   worker therefore selects the chat tab and brings its window to the front.
+   At the end it selects the previous tab again and asks the window manager
+   for the next window in the z-order, which normally gives keyboard focus
+   back to the terminal. A minimised window is restored, not minimised again.
+   The whole exchange is recorded in the bridge's log, and `--check -v` shows
+   the last lines (`page 1a2b3c4d ...`).
 
 Only `127.0.0.1` is bound by default. If you bind elsewhere, requests carrying
 a foreign `Origin` are still rejected, and the worker only talks to the bridge
-from the three supported sites — but anything on that network can also reach
+from the three supported sites. The one exception is the web page served by
+the bridge itself: a request whose `Origin` matches the request's `Host` is
+accepted, so the page can use the API from the same address you opened. It
+does not open CORS to other sites. Anything on that network can still reach
 the bridge, so use `--token` unless the network is trusted.
 
 
@@ -244,6 +301,11 @@ ssh -N "${args[@]}" you@cli-machine
     open before the extension was loaded; reload it.
   - *the extension is polling for …* — the connection works; the problem is on
     the page side (signed in? composer present?).
+  Add `-v` to see how long ago each site last polled, which extension build
+  is loaded (`poll_ages={'gemini': 0.4} extension=0.1.5`) and the last page
+  diagnostics (`page 1a2b3c4d 2.1s ago: ...`). A poll age above
+  10 s means the service worker is not running at that moment, even if it
+  polled recently; an empty `extension=` usually means an older build.
 - **Browser on another machine:** the CLI must listen on an address that
   machine can reach. The default is `127.0.0.1`, which is the *CLI machine's*
   loopback and invisible to a remote browser. Put `{"bind": "0.0.0.0"}` in
@@ -270,9 +332,48 @@ ssh -N "${args[@]}" you@cli-machine
   changes its stop control still works, at the cost of a later finish.
 
 #### Nothing happens for a while on the first command
-- The browser may have suspended the extension worker while idle. The content
-  script reconnects on focus/visibility; moving to the tab wakes it. Once the
-  worker is polling, jobs are picked up within ~2 s.
+- The browser may have suspended the extension worker while idle. An alarm
+  wakes it within about 30 seconds and the content script reconnects; the CLI
+  waits one longer window instead of giving up. Since 0.1.3 the worker also
+  resets its own idle timer while it polls (see *How it works*), so it should
+  not fall asleep while a command is waiting. Since 0.1.5 the worker also
+  brings the chat tab and its window to the front while a job runs, because a
+  hidden Gemini tab can ignore the send click and stop repainting the answer.
+  It restores the previous tab and hands focus back afterwards. If `--check -v`
+  shows a stale `poll_ages` after reloading the extension, the tab was
+  hibernated; the Vivaldi setting below is the remaining lever. The extension
+  also holds a Web Lock in the chat tab and disables auto-discard, so
+  background tabs are not frozen or discarded. Browser-level hibernation can
+  still override this; see
+  [Keeping the chat tab awake in Vivaldi](#keeping-the-chat-tab-awake-in-vivaldi).
+  If a tab was discarded before the extension loaded, activate it once. After
+  updating the extension the worker injects the new content script itself; if
+  the tab is still not picked up, reload the chat tab once.
+
+#### Keeping the chat tab awake in Vivaldi
+Vivaldi's Memory Saver hibernates inactive tabs. The extension's Web Lock and
+`autoDiscardable: false` stop Chromium's own freezing and discarding, but
+Vivaldi's hibernation can still unload the tab and ignore wake messages. The
+per-job tab switch described above works around the hidden-tab behaviour; this
+setting prevents the tab from being unloaded during long idle periods.
+Exclude the chat site:
+
+1. Open `vivaldi://settings/performance/`. On Vivaldi 7.7 and later Memory
+   Saver lives under **Settings → Performance**; on older versions it is under
+   **Settings → Tabs → Memory Saver** (`vivaldi://settings/tabs/`).
+2. Set Memory Saver to **Never save memory** (older versions: **Disabled**).
+   If you want to keep memory saving on, add the chat site to the exceptions
+   list, and pin the chat tab if pinned tabs can be exempted. Pinning is the
+   most reliable exemption when a per-site list is not available.
+3. Do not use the manual **Hibernate** action on this tab or on the window
+   that holds it (right-click the tab → *Hibernate*, including *Hibernate
+   background tabs*). A hibernated tab is greyed out; click it once to reload
+   it, then run `termchat <site> --check` again.
+
+For Chrome and other Chromium browsers, open
+`chrome://settings/performance`, find **Memory Saver**, and add
+`gemini.google.com`, `copilot.microsoft.com` and `chat.deepseek.com` under
+**Always keep these sites active**.
 
 
 ## Limitations
@@ -302,6 +403,9 @@ ssh -N "${args[@]}" you@cli-machine
 Building the CRX needs `openssl` and `zip`; running the CLI and extension does
 not.
 
-The CLI is a single file (`bin/termchat`), the extension is three files
-(`manifest.json`, `background.js`, `content.js`).
+The CLI is a single Python file (`bin/termchat`). The page it serves lives in
+`web/` (`index.html`, `style.css`, `markdown.js`, `app.js`); if the directory
+is missing, `serve` still works for the CLI and the extension, but `/` shows a
+short explanation. The extension is three files (`manifest.json`,
+`background.js`, `content.js`).
 

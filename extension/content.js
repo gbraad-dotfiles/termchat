@@ -17,9 +17,29 @@
   'use strict';
 
   // The worker may inject this file into tabs that were already open when the
-  // extension was installed or reloaded. Do not start a second session.
-  if (globalThis.__termchatContentLoaded) return;
-  globalThis.__termchatContentLoaded = true;
+  // extension was installed or reloaded. Do not start a second session of the
+  // same build. A newer build may take over a tab that still runs an older
+  // content script; the worker then ignores the stale port.
+  const BUILD = '0.1.5';
+  if (globalThis.__termchatContentBuild === BUILD) {
+    const live = globalThis.__termchatContentPort;
+    if (!globalThis.__termchatContentDead && live) {
+      try {
+        // This also wakes the worker if it was suspended. A throw means the
+        // port belongs to an extension context that no longer exists (the
+        // extension was reloaded), so this injection takes the tab over.
+        live.postMessage({ type: 'hello', version: BUILD });
+        return;
+      } catch {
+        /* orphaned content script; start a fresh session below */
+      }
+    } else if (!globalThis.__termchatContentDead) {
+      // The live session is between reconnects; its timer will connect again.
+      return;
+    }
+  }
+  globalThis.__termchatContentBuild = BUILD;
+  globalThis.__termchatContentDead = false;
 
   const api = globalThis.browser ?? globalThis.chrome;
   if (!api || !api.runtime || !api.runtime.connect) return;
@@ -31,7 +51,7 @@
   }[location.hostname];
   if (!SITE) return;
 
-  const VERSION = '0.1.0';
+  const VERSION = BUILD;
 
   const ADAPTERS = {
     gemini: {
@@ -127,6 +147,7 @@
     jobId: null,
     composer: null,
     prompt: '',
+    lastCommandAt: 0,
   };
 
   /* ------------------------------------------------------------------ */
@@ -180,6 +201,17 @@
     if (rect.width < 6 || rect.height < 6) return false;
     const style = getComputedStyle(el);
     return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  // Sent back with every reply so the worker's diagnostics show what the page
+  // itself sees while a job is running.
+  function env() {
+    return {
+      vis: document.visibilityState,
+      focus: document.hasFocus(),
+      w: window.innerWidth,
+      h: window.innerHeight,
+    };
   }
 
   function findFirst(selectors) {
@@ -573,7 +605,19 @@
         }
       }
     }
-    return best;
+    if (best) return best;
+    // A background tab can report a zero-sized layout even though the editor
+    // is there; fall back to the first connected candidate so typing and
+    // submitting can still be attempted.
+    for (const selector of selectors) {
+      for (const el of deepQueryAll(selector)) {
+        if (seen.has(el) || !el.isConnected) continue;
+        if (el.disabled || el.readOnly) continue;
+        if (el.getAttribute('aria-hidden') === 'true') continue;
+        return el;
+      }
+    }
+    return null;
   }
 
   function collectResponses() {
@@ -800,17 +844,17 @@
       const button = findFirst(adapter.newChat);
       if (button) {
         button.click();
-        return { ready: false, newchat: true };
+        return { ready: false, newchat: true, ...env() };
       }
     }
 
     const composer = findComposer();
-    if (!composer) return { ready: false };
+    if (!composer) return { ready: false, ...env() };
     const pre = responseSignature();
 
     if (composerHas(composer, state.prompt)) {
       state.composer = composer;
-      return { ready: true, pre, typed: true };
+      return { ready: true, pre, typed: true, ...env() };
     }
 
     setComposer(composer, state.prompt);
@@ -818,25 +862,42 @@
       return {
         ready: false,
         error: 'could not type the prompt into the message box (try --inspect)',
+        ...env(),
       };
     }
     state.composer = composer;
-    return { ready: true, pre, typed: true };
+    return { ready: true, pre, typed: true, ...env() };
   }
 
   function submit() {
     const composer =
       state.composer && state.composer.isConnected ? state.composer : findComposer();
-    if (!composer) return { submitted: false, empty: true };
-    if (composerEmpty(composer)) return { submitted: false, empty: true };
+    if (!composer) return { submitted: false, empty: true, ...env() };
+    if (composerEmpty(composer)) return { submitted: false, empty: true, ...env() };
 
-    const button = sendCandidates().find(usable);
+    let how = 'button';
+    let button = sendCandidates().find(usable);
+    if (!button) {
+      // The page may report a zero-sized button while the tab is hidden.
+      // Click the real control anyway rather than falling back to Enter,
+      // which these editors are more likely to ignore.
+      for (const selector of adapter.send) {
+        button = deepQueryAll(selector).find(
+          (el) =>
+            el.isConnected &&
+            !el.disabled &&
+            el.getAttribute('aria-disabled') !== 'true'
+        );
+        if (button) break;
+      }
+      if (button) how = 'button-hidden';
+    }
     if (button) {
       button.click();
-      return { submitted: true, how: 'button' };
+      return { submitted: true, how, ...env() };
     }
     pressEnter(composer);
-    return { submitted: true, how: 'enter' };
+    return { submitted: true, how: 'enter', ...env() };
   }
 
   function status() {
@@ -851,6 +912,7 @@
       stop: Boolean(findStopButton()),
       promptInComposer: composer ? composerHas(composer, state.prompt) : false,
       url: location.href,
+      ...env(),
     };
   }
 
@@ -924,6 +986,7 @@
 
   function onMessage(msg) {
     if (!msg || msg.id == null) return;
+    state.lastCommandAt = Date.now();
     let reply;
     try {
       if (msg.cmd === 'prepare') reply = prepare(msg);
@@ -960,12 +1023,24 @@
     try {
       port = api.runtime.connect({ name: 'termchat' });
     } catch {
+      // After an extension reload this context is dead and every call throws.
+      // A later injection can use the flag to take the tab over.
+      globalThis.__termchatContentDead = true;
       scheduleReconnect();
       return;
     }
+    globalThis.__termchatContentDead = false;
     state.port = port;
+    // `executeScript` may run this file again in the same tab. A later copy
+    // uses this handle to tell a live session from an orphaned one.
+    globalThis.__termchatContentPort = port;
     port.onMessage.addListener(onMessage);
     port.onDisconnect.addListener(() => {
+      // A newer port may already have replaced this one.
+      if (state.port !== port) return;
+      if (globalThis.__termchatContentPort === port) {
+        globalThis.__termchatContentPort = null;
+      }
       state.port = null;
       state.composer = null;
       scheduleReconnect();
@@ -974,6 +1049,68 @@
       port.postMessage({ type: 'hello', site: SITE, version: VERSION });
     } catch {
       /* ignore */
+    }
+  }
+
+  // A port message wakes a sleeping service worker. Send one periodically while
+  // the page lives, so an idle tab does not silently stop polling; the worker's
+  // alarm covers the periods when a hidden tab's timers are throttled.
+  function hello() {
+    if (!state.port) {
+      connect();
+      return;
+    }
+    try {
+      state.port.postMessage({ type: 'hello', site: SITE, version: VERSION });
+    } catch {
+      state.port = null;
+      connect();
+    }
+  }
+
+  // After the worker was stopped, its end of the old port is gone. A fresh
+  // connection is the only way to be sure hello reaches the new worker
+  // instance. Do not do this while a job is actively exchanging commands.
+  function wake() {
+    const busy = state.jobId && Date.now() - state.lastCommandAt < 10000;
+    if (busy) {
+      hello();
+      return;
+    }
+    const port = state.port;
+    state.port = null;
+    if (port) {
+      try {
+        port.disconnect();
+      } catch {
+        /* already gone */
+      }
+    }
+    connect();
+  }
+
+  if (api.runtime && api.runtime.onMessage) {
+    api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      if (!msg || msg.type !== 'termchat-wake') return undefined;
+      wake();
+      if (sendResponse) sendResponse({ ok: true, site: SITE });
+      return true;
+    });
+  }
+
+  setInterval(hello, 20000);
+
+  // Chrome freezes hidden tabs after a few minutes, and a frozen tab cannot
+  // answer the worker. Holding a Web Lock is one of the documented opt-outs
+  // from freezing; it costs no CPU.
+  const nav = globalThis.navigator;
+  if (nav && nav.locks && nav.locks.request) {
+    try {
+      nav.locks
+        .request('termchat-keepalive', { mode: 'shared' }, () => new Promise(() => {}))
+        .catch(() => {});
+    } catch {
+      /* the API is unavailable in this context */
     }
   }
 

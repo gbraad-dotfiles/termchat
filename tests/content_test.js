@@ -82,14 +82,28 @@ globalThis.location = {
   hostname: 'gemini.google.com',
   href: 'https://gemini.google.com/app/1',
 };
+let wakeListener = null;
+let connections = 0;
+let orphan = false;
+const sent = [];
 globalThis.chrome = {
   runtime: {
     connect() {
+      connections += 1;
       return {
-        postMessage() {},
+        postMessage(msg) {
+          if (orphan) throw new Error('Extension context invalidated');
+          sent.push(msg);
+        },
+        disconnect() {},
         onMessage: { addListener() {} },
         onDisconnect: { addListener() {} },
       };
+    },
+    onMessage: {
+      addListener(fn) {
+        wakeListener = fn;
+      },
     },
   },
 };
@@ -99,6 +113,14 @@ const source = fs.readFileSync(
   'utf8'
 );
 vm.runInThisContext(source, { filename: 'content.js' });
+
+const firstConnections = connections;
+vm.runInThisContext(source, { filename: 'content.js' });
+assert.strictEqual(
+  connections,
+  firstConnections,
+  'the same content-script build started twice'
+);
 
 const serializer = globalThis.__termchatTest;
 assert.ok(serializer, 'content.js did not expose its test hook');
@@ -156,4 +178,30 @@ assert.match(markdown, /\| 1 \| 2 \|/, 'table row');
 const cleaned = serializer.tidyMarkdown('# A\n\n\n\ntext\n');
 assert.strictEqual(cleaned, '# A\n\ntext', 'blank lines collapsed');
 
+// The worker's keepalive alarm sends a wake message; the content script must
+// answer by re-announcing itself so the polling loop restarts.
+assert.ok(wakeListener, 'content.js did not register a wake listener');
+let reply = null;
+wakeListener({ type: 'termchat-wake' }, {}, (value) => {
+  reply = value;
+});
+assert.deepStrictEqual(reply, { ok: true, site: 'gemini' });
+assert.ok(
+  sent.filter((msg) => msg && msg.type === 'hello').length >= 2,
+  'wake did not announce the tab'
+);
+assert.ok(connections >= 2, 'wake did not open a fresh port');
+
+// After an extension reload the old instance's port throws. A new injection of
+// the same build must start a session instead of reusing the dead one.
+const beforeOrphan = connections;
+orphan = true;
+vm.runInThisContext(source, { filename: 'content.js' });
+assert.ok(
+  connections > beforeOrphan,
+  'a new injection reused an orphaned port instead of reconnecting'
+);
+orphan = false;
+
 console.log('content: markdown extraction OK');
+process.exit(0);

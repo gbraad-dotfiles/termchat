@@ -128,6 +128,20 @@ else
   sed 's/^/     /' "$tmp/sw2.log"
 fi
 
+# 9b. a content script left behind by an extension reload is not driven
+node tests/sw_harness.js stale >"$tmp/sw-stale.log" 2>&1 &
+sw=$!
+sleep 1
+out="$(tc gemini "hi" --wait 10 --timeout 20)"
+wait "$sw"
+sw_code=$?
+if [[ $sw_code -eq 0 && "$out" == "Hello world" ]]; then
+  ok "stale content script ignored"
+else
+  bad "stale content script ignored (exit $sw_code, output '$out')"
+  sed 's/^/     /' "$tmp/sw-stale.log"
+fi
+
 # 10. token-protected bridge accepts the matching token
 python3 tests/fake_extension.py gemini --reply "secret answer" --token s3cret --timeout 8 &
 fake=$!
@@ -236,6 +250,78 @@ else
   sed 's/^/     /' "$tmp/serve3.log"
 fi
 
+# 15b. the web UI is served, rejects foreign origins and drives the same API
+env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
+  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve5.log" 2>&1 &
+server_pid=$!
+sleep 0.6
+base="http://127.0.0.1:$server_port"
+index_code=$(curl -sS -o "$tmp/index.html" -w '%{http_code}' "$base/")
+css_code=$(curl -sS -o "$tmp/style.css" -w '%{http_code}' "$base/style.css")
+js_code=$(curl -sS -o "$tmp/app.js" -w '%{http_code}' "$base/app.js")
+md_code=$(curl -sS -o "$tmp/markdown.js" -w '%{http_code}' "$base/markdown.js")
+if [[ "$index_code" == 200 && "$css_code" == 200 && "$js_code" == 200 && "$md_code" == 200 ]] \
+  && grep -q 'id="composer"' "$tmp/index.html" \
+  && grep -q -- '--accent: #CF1A37' "$tmp/style.css" \
+  && grep -q '/v1/state/' "$tmp/app.js" \
+  && grep -q 'TermchatMarkdown' "$tmp/markdown.js" \
+  && node --check "$tmp/app.js" 2>/dev/null \
+  && node --check "$tmp/markdown.js" 2>/dev/null; then
+  ok "web UI assets"
+else
+  bad "web UI assets (index=$index_code css=$css_code js=$js_code markdown=$md_code)"
+fi
+
+foreign=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -H 'Origin: http://evil.example' \
+  -d '{"site":"gemini","prompt":"nope"}' "$base/v1/request")
+python3 tests/fake_extension.py gemini --reply "web answer" --timeout 8 &
+fake=$!
+created=$(curl -sS -X POST -H 'Content-Type: application/json' -H "Origin: $base" \
+  -d '{"site":"gemini","prompt":"from the page","timeout":10}' "$base/v1/request")
+jid=$(printf '%s' "$created" | python3 -c \
+  'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+wait "$fake" || true
+final=""
+if [[ -n "$jid" ]]; then
+  final=$(curl -sS "$base/v1/state/$jid?after=0&wait=0" -H "Origin: $base" \
+    | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); print(d.get("text","") if d.get("state")=="done" else "")' \
+    2>/dev/null)
+fi
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+server_pid=""
+if [[ "$foreign" == 403 && "$final" == "web answer" ]]; then
+  ok "web UI same-origin flow"
+else
+  bad "web UI same-origin flow (foreign=$foreign, final='$final', created='$created')"
+  sed 's/^/     /' "$tmp/serve5.log"
+fi
+
+# 15c. the web page loads without a token, but its API calls still need one
+env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
+  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 --token s3cret \
+  >"$tmp/serve6.log" 2>&1 &
+server_pid=$!
+sleep 0.6
+page_code=$(curl -sS -o /dev/null -w '%{http_code}' "$base/")
+no_token=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -H "Origin: $base" \
+  -d '{"site":"gemini","prompt":"nope"}' "$base/v1/request")
+yes_token=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Content-Type: application/json' -H "Origin: $base" -H 'X-Termchat-Token: s3cret' \
+  -d '{"site":"gemini","prompt":"ok"}' "$base/v1/request")
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+server_pid=""
+if [[ "$page_code" == 200 && "$no_token" == 401 && "$yes_token" == 200 ]]; then
+  ok "web UI token"
+else
+  bad "web UI token (page=$page_code, without=$no_token, with=$yes_token)"
+  sed 's/^/     /' "$tmp/serve6.log"
+fi
+
 # 16. queue state machine (fast, no HTTP)
 if python3 tests/bridge_test.py >/dev/null 2>"$tmp/bridge.err"; then
   ok "queue state machine"
@@ -250,6 +336,22 @@ if python3 tests/markdown_test.py >/dev/null 2>"$tmp/markdown.err"; then
 else
   bad "markdown renderer"
   sed 's/^/     /' "$tmp/markdown.err"
+fi
+
+# 17b. the interactive activity line stays quiet when stderr is not a TTY
+if python3 tests/activity_test.py >/dev/null 2>"$tmp/activity.err"; then
+  ok "activity indicator"
+else
+  bad "activity indicator"
+  sed 's/^/     /' "$tmp/activity.err"
+fi
+
+# 17c. the web UI's Markdown renderer escapes HTML and unsafe links
+if node tests/web_test.js >/dev/null 2>"$tmp/web.err"; then
+  ok "web markdown renderer"
+else
+  bad "web markdown renderer"
+  sed 's/^/     /' "$tmp/web.err"
 fi
 
 # 18. answer DOM -> Markdown
@@ -285,7 +387,37 @@ else
   bad "markdown --plain: got '$plain'"
 fi
 
-# 20. the worker forwards the content script's Markdown to the CLI
+# 20. a worker suspended after its last ping gets one longer window
+python3 tests/fake_extension.py gemini --reply "late answer" --idle-before 4 --timeout 12 &
+fake=$!
+out="$(tc gemini "hi" --wait 2 --timeout 10)"
+wait "$fake" || true
+if [[ "$out" == "late answer" ]]; then
+  ok "sleeping extension"
+else
+  bad "sleeping extension: got '$out'"
+fi
+
+# 20b. the same on the shared server
+env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
+  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve4.log" 2>&1 &
+server_pid=$!
+sleep 0.6
+python3 tests/fake_extension.py gemini --reply "late server answer" --idle-before 4 --timeout 12 &
+fake=$!
+out="$(tc gemini "hi" --server "127.0.0.1:$server_port" --wait 2 --timeout 10)"
+wait "$fake" || true
+kill "$server_pid" 2>/dev/null || true
+wait "$server_pid" 2>/dev/null || true
+server_pid=""
+if [[ "$out" == "late server answer" ]]; then
+  ok "sleeping extension on server"
+else
+  bad "sleeping extension on server: got '$out'"
+  sed 's/^/     /' "$tmp/serve4.log"
+fi
+
+# 21. the worker forwards the content script's Markdown to the CLI
 node tests/sw_harness.js markdown >"$tmp/sw3.log" 2>&1 &
 sw=$!
 sleep 1
