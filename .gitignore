@@ -1,3 +1,24 @@
 dist/
+
+# Binaries
+/termchat
+/termchat-arm64
+*.exe
+*.test
+*.out
+
+# CMake build files
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+
+# RPM build artifacts
+*.tar.gz
+*.rpm
+*.src.rpm
+rpmbuild/
+
+# Python helpers (extension packaging)
 __pycache__/
 *.pyc

@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
-# Link the CLI into ~/.local/bin and print the extension install steps.
+# Build and link the CLI into ~/.local/bin, then print the extension steps.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 prefix="${PREFIX:-$HOME/.local}"
 
-chmod +x "$here/bin/termchat" "$here/build.sh" "$here/pack_crx.py" "$here/tests/run.sh" "$here/tests/fake_extension.py"
+if command -v go >/dev/null 2>&1; then
+  (cd "$here" && go build -o termchat .)
+fi
+if [[ ! -x "$here/termchat" ]]; then
+  echo "termchat is not built; install Go and run 'go build -o termchat .'" >&2
+  exit 1
+fi
+
+chmod +x "$here/build.sh" "$here/pack_crx.py" "$here/tests/run.sh" "$here/tests/fake_extension.py"
 mkdir -p "$prefix/bin"
-ln -sf "$here/bin/termchat" "$prefix/bin/termchat"
+ln -sf "$here/termchat" "$prefix/bin/termchat"
 
 echo "linked $prefix/bin/termchat"
 echo

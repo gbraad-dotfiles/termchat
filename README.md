@@ -22,7 +22,7 @@ and reads the answer back as it streams.
 
 ## Requirements
 
-- Python 3.9+ (standard library only — nothing to `pip install`)
+- Go 1.24+ to build (the binary has no runtime dependencies)
 - A Chromium-based browser (Vivaldi, Chrome, Edge, Brave…) — the primary target
 - A Firefox build is included as a convenience (`build.sh firefox`)
 
@@ -33,8 +33,8 @@ and reads the answer back as it streams.
 ./install.sh
 ```
 
-That links `termchat` into `~/.local/bin` (`PREFIX=…` to change) and prints the
-extension steps. Then, in Vivaldi:
+That builds the Go binary, links `termchat` into `~/.local/bin` (`PREFIX=…` to
+change) and prints the extension steps. Then, in Vivaldi:
 
 1. open `chrome://extensions`
 2. turn on `Developer mode`
@@ -395,17 +395,31 @@ For Chrome and other Chromium browsers, open
 ## Development
 
 ```sh
-./build.sh            # dist/chromium, dist/firefox, .zip and signed .crx
-./tests/run.sh        # protocol + server tests with a fake extension (no browser)
-./sync.sh --build     # copy the folder to another machine (REMOTE=… to change)
+go build -o termchat .   # plain Go build
+./tests/run.sh           # Go unit tests + protocol/server tests with a fake extension
+./build.sh               # dist/chromium, dist/firefox, .zip and signed .crx
+./sync.sh --build        # copy the folder to another machine (REMOTE=… to change)
 ```
 
-Building the CRX needs `openssl` and `zip`; running the CLI and extension does
-not.
+The same layout is available through CMake, mirroring the other gbraad
+projects:
 
-The CLI is a single Python file (`bin/termchat`). The page it serves lives in
-`web/` (`index.html`, `style.css`, `markdown.js`, `app.js`); if the directory
-is missing, `serve` still works for the CLI and the extension, but `/` shows a
-short explanation. The extension is three files (`manifest.json`,
+```sh
+cmake -B build
+cmake --build build              # go build
+cmake --build build --target test    # go test -v ./...
+cmake --build build --target rpm     # rpmbuild from termchat.spec
+cmake --build build --target arm64   # Linux/arm64 cross-build
+```
+
+Building the CRX needs `openssl` and `zip`; building and running the CLI and
+extension need only Go and a browser. The extension packaging (`pack_crx.py`)
+and the fake extension used by the test suite are Python scripts.
+
+The CLI is the Go package in the repository root (`main.go`, `bridge.go`,
+`client.go`, `render.go`, `prompt.go`, `activity.go`). The page it serves lives
+in `public/` (`index.html`, `style.css`, `markdown.js`, `app.js`) and is
+compiled into the binary with `go:embed`, so `termchat serve` can be copied to
+another machine on its own. The extension is three files (`manifest.json`,
 `background.js`, `content.js`).
 

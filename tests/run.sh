@@ -3,6 +3,11 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+if ! go build -o termchat .; then
+  echo "FAIL build"
+  exit 1
+fi
+
 tmp="$(mktemp -d)"
 server_pid=""
 cleanup() {
@@ -24,7 +29,7 @@ ok() { printf 'ok   %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; status=1; }
 
 tc() {
-  env XDG_CONFIG_HOME="$tmp/config" XDG_CACHE_HOME="$tmp/cache" ./bin/termchat "$@"
+  env XDG_CONFIG_HOME="$tmp/config" XDG_CACHE_HOME="$tmp/cache" ./termchat "$@"
 }
 
 # 1. basic answer
@@ -178,7 +183,7 @@ fi
 # 13. persistent server, explicit --server
 server_port=$((TERMCHAT_BASE_PORT + 1))
 env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
-  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve.log" 2>&1 &
+  ./termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve.log" 2>&1 &
 server_pid=$!
 sleep 0.6
 python3 tests/fake_extension.py gemini --reply "server answer" --timeout 8 &
@@ -198,7 +203,7 @@ fi
 
 # 14. a local server is auto-detected; two clients queue on one site
 env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
-  ./bin/termchat serve --port "$TERMCHAT_BASE_PORT" --bind 127.0.0.1 >"$tmp/serve2.log" 2>&1 &
+  ./termchat serve --port "$TERMCHAT_BASE_PORT" --bind 127.0.0.1 >"$tmp/serve2.log" 2>&1 &
 server_pid=$!
 sleep 0.6
 python3 tests/fake_extension.py gemini --reply @echo --jobs 2 --timeout 12 &
@@ -227,7 +232,7 @@ fi
 # 15. an abandoned client job does not block later jobs
 env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
   TERMCHAT_PENDING_TTL=2 \
-  ./bin/termchat serve --port "$TERMCHAT_BASE_PORT" --bind 127.0.0.1 >"$tmp/serve3.log" 2>&1 &
+  ./termchat serve --port "$TERMCHAT_BASE_PORT" --bind 127.0.0.1 >"$tmp/serve3.log" 2>&1 &
 server_pid=$!
 sleep 0.6
 curl -sS -m 3 -X POST -H 'Content-Type: application/json' \
@@ -252,7 +257,7 @@ fi
 
 # 15b. the web UI is served, rejects foreign origins and drives the same API
 env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
-  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve5.log" 2>&1 &
+  ./termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve5.log" 2>&1 &
 server_pid=$!
 sleep 0.6
 base="http://127.0.0.1:$server_port"
@@ -301,7 +306,7 @@ fi
 
 # 15c. the web page loads without a token, but its API calls still need one
 env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
-  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 --token s3cret \
+  ./termchat serve --port "$server_port" --bind 127.0.0.1 --token s3cret \
   >"$tmp/serve6.log" 2>&1 &
 server_pid=$!
 sleep 0.6
@@ -323,7 +328,7 @@ else
 fi
 
 # 16. queue state machine (fast, no HTTP)
-if python3 tests/bridge_test.py >/dev/null 2>"$tmp/bridge.err"; then
+if go test -run '^TestBridgeQueue$' . >/dev/null 2>"$tmp/bridge.err"; then
   ok "queue state machine"
 else
   bad "queue state machine"
@@ -331,7 +336,7 @@ else
 fi
 
 # 17. Markdown renderer
-if python3 tests/markdown_test.py >/dev/null 2>"$tmp/markdown.err"; then
+if go test -run '^TestRenderMarkdown$' . >/dev/null 2>"$tmp/markdown.err"; then
   ok "markdown renderer"
 else
   bad "markdown renderer"
@@ -339,7 +344,7 @@ else
 fi
 
 # 17b. the interactive activity line stays quiet when stderr is not a TTY
-if python3 tests/activity_test.py >/dev/null 2>"$tmp/activity.err"; then
+if go test -run '^TestActivity$' . >/dev/null 2>"$tmp/activity.err"; then
   ok "activity indicator"
 else
   bad "activity indicator"
@@ -400,7 +405,7 @@ fi
 
 # 20b. the same on the shared server
 env XDG_CONFIG_HOME="$tmp/config" TERMCHAT_BASE_PORT="$TERMCHAT_BASE_PORT" \
-  ./bin/termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve4.log" 2>&1 &
+  ./termchat serve --port "$server_port" --bind 127.0.0.1 >"$tmp/serve4.log" 2>&1 &
 server_pid=$!
 sleep 0.6
 python3 tests/fake_extension.py gemini --reply "late server answer" --idle-before 4 --timeout 12 &

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /* Checks for the web UI's Markdown renderer and its HTML-escaping rules.
- * Runs the same web/markdown.js the browser loads, without a DOM. */
+ * Runs the same public/markdown.js the browser loads, without a DOM. */
 
 'use strict';
 
@@ -11,7 +11,7 @@ const vm = require('vm');
 const sandbox = { window: {} };
 vm.createContext(sandbox);
 vm.runInContext(
-  fs.readFileSync(path.join(__dirname, '..', 'web', 'markdown.js'), 'utf8'),
+  fs.readFileSync(path.join(__dirname, '..', 'public', 'markdown.js'), 'utf8'),
   sandbox,
   { filename: 'markdown.js' }
 );
@@ -144,8 +144,8 @@ check('table cells are escaped', alpha.includes('&lt;b&gt;x&lt;/b&gt;'), alpha);
 
 // The page and the script must agree on element ids, and the renderer has to
 // be loaded before app.js uses it.
-const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'index.html'), 'utf8');
-const app = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+const app = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 const ids = new Set([...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]));
 const usedIds = new Set(
   [...app.matchAll(/getElementById\('([^']+)'\)/g)].map((match) => match[1])
